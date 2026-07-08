@@ -74,8 +74,11 @@ GitHub Actions builds downloadable archives:
 - `adb-proxy-linux-x86_64-musl.tar.gz`
 - `adb-proxy-macos-aarch64.tar.gz`
 - `adb-proxy-macos-x86_64.tar.gz`
+- `adb-proxy-windows-x86_64.tar.gz`
 
 The Linux artifact targets `x86_64-unknown-linux-musl` so it can run on common Linux hosts without depending on the host glibc.
+
+The Windows artifact contains `adb-proxy.exe` built for `x86_64-pc-windows-msvc`.
 
 ## Development
 

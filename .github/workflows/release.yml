@@ -22,19 +22,29 @@ jobs:
             target: x86_64-unknown-linux-musl
             build: cargo build --release --target x86_64-unknown-linux-musl
             bin: target/x86_64-unknown-linux-musl/release/adb-proxy
+            executable: adb-proxy
             archive: adb-proxy-linux-x86_64-musl.tar.gz
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             build: cargo build --release --target aarch64-apple-darwin
             bin: target/aarch64-apple-darwin/release/adb-proxy
+            executable: adb-proxy
             archive: adb-proxy-macos-aarch64.tar.gz
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             build: cargo build --release --target x86_64-apple-darwin
             bin: target/x86_64-apple-darwin/release/adb-proxy
+            executable: adb-proxy
             archive: adb-proxy-macos-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: cargo build --release --target x86_64-pc-windows-msvc
+            bin: target/x86_64-pc-windows-msvc/release/adb-proxy.exe
+            executable: adb-proxy.exe
+            archive: adb-proxy-windows-x86_64.tar.gz
 
     steps:
       - name: Checkout
@@ -66,8 +76,8 @@ jobs:
           set -euo pipefail
           staging="dist/${{ matrix.name }}"
           mkdir -p "$staging"
-          cp "${{ matrix.bin }}" "$staging/adb-proxy"
-          chmod +x "$staging/adb-proxy"
+          cp "${{ matrix.bin }}" "$staging/${{ matrix.executable }}"
+          chmod +x "$staging/${{ matrix.executable }}"
           printf '%s\n' \
             'adb-proxy' \
             '' \
@@ -75,6 +85,7 @@ jobs:
             '' \
             '    adb start-server' \
             '    ./adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
+            '    adb-proxy.exe --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
             '' \
             'Run from a remote client:' \
             '' \
