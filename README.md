@@ -80,6 +80,17 @@ The Linux artifact targets `x86_64-unknown-linux-musl` so it can run on common L
 
 The Windows artifact contains `adb-proxy.exe` built for `x86_64-pc-windows-msvc`.
 
+## Automatic Releases
+
+Releases are driven by `Cargo.toml`:
+
+1. Update `package.version`, for example `0.1.1`.
+2. Push to `main`.
+3. GitHub Actions builds all platforms.
+4. If release `v0.1.1` does not already exist, the workflow creates tag `v0.1.1`, creates a GitHub Release, and uploads the archives.
+
+Pushing an explicit `v*` tag also builds and publishes that tag.
+
 ## Development
 
 ```bash
