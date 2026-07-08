@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: cargo build --release --target x86_64-unknown-linux-musl
+            bin: target/x86_64-unknown-linux-musl/release/adb-proxy
+            archive: adb-proxy-linux-x86_64-musl.tar.gz
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            build: cargo build --release --target aarch64-apple-darwin
+            bin: target/aarch64-apple-darwin/release/adb-proxy
+            archive: adb-proxy-macos-aarch64.tar.gz
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            build: cargo build --release --target x86_64-apple-darwin
+            bin: target/x86_64-apple-darwin/release/adb-proxy
+            archive: adb-proxy-macos-x86_64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: ${{ matrix.build }}
+
+      - name: Verify Linux static binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          file "${{ matrix.bin }}"
+          ldd "${{ matrix.bin }}" 2>&1 | grep -E 'not a dynamic executable|statically linked'
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="dist/${{ matrix.name }}"
+          mkdir -p "$staging"
+          cp "${{ matrix.bin }}" "$staging/adb-proxy"
+          chmod +x "$staging/adb-proxy"
+          printf '%s\n' \
+            'adb-proxy' \
+            '' \
+            'Run on the machine connected to the USB Android device:' \
+            '' \
+            '    adb start-server' \
+            '    ./adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
+            '' \
+            'Run from a remote client:' \
+            '' \
+            '    adb -H <server_ip> -P 5038 devices' \
+            '    adb -H <server_ip> -P 5038 shell' \
+            > "$staging/README.txt"
+          tar -C "$staging" -czf "dist/${{ matrix.archive }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
