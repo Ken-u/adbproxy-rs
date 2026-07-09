@@ -49,6 +49,60 @@ radb devices
 radb shell
 ```
 
+## adb Wrapper Setup
+
+The repository also includes `adb_setup.sh`, which installs a local `adb`
+wrapper. The wrapper keeps using the original adb binary, but automatically
+adds the configured remote adb-proxy host and port to normal adb commands.
+
+Install the wrapper on the remote client machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.sh | bash
+```
+
+Then configure the proxy address:
+
+```bash
+adb --adbproxy-setup
+```
+
+The setup prompt asks for:
+
+- Remote adb-proxy IP or hostname
+- Remote adb-proxy port, defaulting to `5038`
+- Optional default device SN
+
+After setup, normal adb commands are forwarded through the configured proxy:
+
+```bash
+adb devices
+adb shell
+adb install app.apk
+```
+
+If a default device SN was configured, the wrapper adds `-s <sn>` automatically
+unless the command already specifies a serial:
+
+```bash
+adb shell
+adb -s <other_sn> shell
+```
+
+Switch back to the local adb server:
+
+```bash
+adb --adbproxy-local
+```
+
+Remove the wrapper and restore the original adb binary:
+
+```bash
+adb --adbproxy-uninstall
+```
+
+Configuration is stored in `~/.adbproxy`.
+
 ## Binary Usage
 
 ```bash
