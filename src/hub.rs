@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-use crate::backend::run_backend_poller;
+use crate::backend::{fetch_server_version, run_backend_poller};
 use crate::config::{BackendConfig, HubConfig};
 use crate::local::LocalAdb;
 use crate::registry::DeviceRegistry;
@@ -46,7 +46,16 @@ pub async fn run_hub_with_shutdown(
         let local = LocalAdb::prepare(config.local_adb_port)
             .await
             .map_err(HubError::LocalAdb)?;
-        // Prepend local backend; skip if user already configured the same name/addr.
+        // Match the real adb server's ADB_SERVER_VERSION so clients don't kill us.
+        match fetch_server_version(local.addr).await {
+            Ok(v) => {
+                info!(adb_version = v, "synced hub version from local adb server");
+                config.adb_version = v;
+            }
+            Err(err) => {
+                warn!(error = %err, "could not read local adb version; using configured value");
+            }
+        }
         let local_backend = BackendConfig {
             name: LocalAdb::backend_name().to_string(),
             addr: local.addr,

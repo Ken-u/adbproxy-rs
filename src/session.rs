@@ -18,87 +18,86 @@ pub struct SessionContext {
     pub kill_notify: Arc<Notify>,
 }
 
-/// Handle one adb client connection in host mode until disconnect or transport bind.
+/// Handle one adb client connection.
+///
+/// Real adb servers close the socket after one-shot host queries (`host:version`,
+/// `host:devices`, …). Keeping the connection open makes official clients hang
+/// waiting for EOF after reading the response.
 pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Result<()> {
-    loop {
-        let payload = match read_packet(&mut client).await {
-            Ok(p) => p,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(err) => return Err(err),
-        };
+    let payload = match read_packet(&mut client).await {
+        Ok(p) => p,
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(err) => return Err(err),
+    };
 
-        let service = match String::from_utf8(payload) {
-            Ok(s) => s,
-            Err(_) => {
-                write_fail(&mut client, "invalid utf8 service").await?;
-                continue;
-            }
-        };
-
-        debug!(service = %service, "host service");
-
-        if service == "host:version" {
-            let ver = format!("{:04x}", ctx.adb_version);
-            write_okay_payload(&mut client, ver.as_bytes()).await?;
-            continue;
-        }
-
-        if service == "host:devices" || service == "host:devices-l" {
-            let long = service.ends_with("-l");
-            let body = ctx.registry.snapshot().await.format_devices(long);
-            write_okay_payload(&mut client, body.as_bytes()).await?;
-            continue;
-        }
-
-        if service == "host:track-devices" || service == "host:track-devices-l" {
-            let long = service.ends_with("-l");
-            return track_devices(&mut client, &ctx.registry, long).await;
-        }
-
-        if service == "host:kill" {
-            write_okay(&mut client).await?;
-            ctx.kill_notify.notify_waiters();
+    let service = match String::from_utf8(payload) {
+        Ok(s) => s,
+        Err(_) => {
+            write_fail(&mut client, "invalid utf8 service").await?;
             return Ok(());
         }
+    };
 
-        if let Some(serial) = service.strip_prefix("host:transport:") {
-            return bind_transport(&mut client, &ctx, serial).await;
-        }
+    debug!(service = %service, "host service");
 
-        if service == "host:transport-any" {
-            let snap = ctx.registry.snapshot().await;
-            let online: Vec<_> = snap
-                .devices
-                .iter()
-                .filter(|d| d.state == "device")
-                .collect();
-            match online.len() {
-                0 => {
-                    write_fail(&mut client, "no devices/emulators found").await?;
-                    continue;
-                }
-                1 => {
-                    return bind_transport(&mut client, &ctx, &online[0].public_serial).await;
-                }
-                _ => {
-                    write_fail(&mut client, "more than one device/emulator").await?;
-                    continue;
-                }
-            }
-        }
-
-        // host-serial:<serial>:<request> — rewrite serial if needed and forward.
-        if let Some(rest) = service.strip_prefix("host-serial:") {
-            return forward_host_serial(&mut client, &ctx, rest).await;
-        }
-
-        // host:<request> that is serial-scoped via host: prefix variants we don't implement.
-        write_fail(
-            &mut client,
-            &format!("adb-hub: unsupported service '{service}'"),
-        )
-        .await?;
+    if service == "host:version" {
+        let ver = format!("{:04x}", ctx.adb_version);
+        write_okay_payload(&mut client, ver.as_bytes()).await?;
+        return Ok(());
     }
+
+    if service == "host:devices" || service == "host:devices-l" {
+        let long = service.ends_with("-l");
+        let body = ctx.registry.snapshot().await.format_devices(long);
+        write_okay_payload(&mut client, body.as_bytes()).await?;
+        return Ok(());
+    }
+
+    if service == "host:track-devices" || service == "host:track-devices-l" {
+        let long = service.ends_with("-l");
+        return track_devices(&mut client, &ctx.registry, long).await;
+    }
+
+    if service == "host:kill" {
+        write_okay(&mut client).await?;
+        ctx.kill_notify.notify_waiters();
+        return Ok(());
+    }
+
+    if let Some(serial) = service.strip_prefix("host:transport:") {
+        return bind_transport(&mut client, &ctx, serial).await;
+    }
+
+    if service == "host:transport-any" {
+        let snap = ctx.registry.snapshot().await;
+        let online: Vec<_> = snap
+            .devices
+            .iter()
+            .filter(|d| d.state == "device")
+            .collect();
+        return match online.len() {
+            0 => {
+                write_fail(&mut client, "no devices/emulators found").await?;
+                Ok(())
+            }
+            1 => bind_transport(&mut client, &ctx, &online[0].public_serial).await,
+            _ => {
+                write_fail(&mut client, "more than one device/emulator").await?;
+                Ok(())
+            }
+        };
+    }
+
+    if let Some(rest) = service.strip_prefix("host-serial:") {
+        return forward_host_serial(&mut client, &ctx, rest).await;
+    }
+
+    write_fail(
+        &mut client,
+        &format!("adb-hub: unsupported service '{service}'"),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn bind_transport(
@@ -146,7 +145,6 @@ async fn track_devices(
     write_okay(client).await?;
     let mut rx = registry.subscribe();
 
-    // Initial snapshot.
     let body = registry.snapshot().await.format_devices(long);
     write_packet(client, body.as_bytes()).await?;
 
@@ -175,7 +173,6 @@ async fn forward_host_serial(
     ctx: &SessionContext,
     rest: &str,
 ) -> io::Result<()> {
-    // rest = "<serial>:<request...>"
     let Some((public_serial, request)) = rest.split_once(':') else {
         write_fail(client, "invalid host-serial service").await?;
         return Ok(());
@@ -191,7 +188,6 @@ async fn forward_host_serial(
     let mut upstream = TcpStream::connect(entry.backend_addr).await?;
     write_service(&mut upstream, &upstream_service).await?;
 
-    // Client request already consumed; relay upstream response bytes as-is.
     match tokio::io::copy(&mut upstream, client).await {
         Ok(_) => Ok(()),
         Err(err) if is_benign(&err) => Ok(()),

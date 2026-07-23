@@ -74,7 +74,7 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
             listen: HubConfig::default_listen(),
             poll_interval: std::time::Duration::from_millis(1000),
             backends,
-            adb_version: 40,
+            adb_version: 41,
             include_local: !args.no_local,
             local_adb_port: args.local_port.unwrap_or(5039),
         }

@@ -7,6 +7,21 @@ use tracing::{debug, warn};
 
 use crate::config::{BackendConfig, HubConfig};
 use crate::protocol::{read_okay_payload, write_service};
+
+/// Query `host:version` from an adb server; returns decimal ADB_SERVER_VERSION.
+pub async fn fetch_server_version(addr: std::net::SocketAddr) -> io::Result<u32> {
+    let mut stream = timeout(QUERY_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+    write_service(&mut stream, "host:version").await?;
+    let body = timeout(QUERY_TIMEOUT, read_okay_payload(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timeout"))??;
+    let text = std::str::from_utf8(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    u32::from_str_radix(text.trim(), 16)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 use crate::registry::DeviceRegistry;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);

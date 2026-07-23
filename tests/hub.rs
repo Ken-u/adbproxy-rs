@@ -67,7 +67,7 @@ async fn hub_lists_and_transports() {
             name: "mock".into(),
             addr: backend_addr,
         }],
-        adb_version: 40,
+        adb_version: 41,
         include_local: false,
         local_adb_port: 5039,
     };
@@ -88,7 +88,7 @@ async fn hub_lists_and_transports() {
         let mut c = TcpStream::connect(hub_addr).await.unwrap();
         write_service(&mut c, "host:version").await.unwrap();
         let body = read_okay_payload(&mut c).await.unwrap();
-        assert_eq!(body, b"0028");
+        assert_eq!(body, b"0029");
     }
 
     {
@@ -148,7 +148,7 @@ async fn hub_rewrites_conflicting_serials() {
                 addr: addr_b,
             },
         ],
-        adb_version: 40,
+        adb_version: 41,
         include_local: false,
         local_adb_port: 5039,
     };

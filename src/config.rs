@@ -69,7 +69,9 @@ fn default_poll_ms() -> u64 {
 }
 
 fn default_adb_version() -> u32 {
-    40
+    // Must match ADB_SERVER_VERSION of the installed adb client (1.0.41 → 41).
+    // A mismatch makes the client try to kill/restart the server and appear to hang.
+    41
 }
 
 fn default_include_local() -> bool {
