@@ -84,17 +84,25 @@ fn route_service(
     default_backend: SocketAddr,
     default_pair_code: Option<&str>,
 ) -> Result<(SocketAddr, Option<String>, String), String> {
-    // host:transport:SERIAL
-    if let Some(serial) = service.strip_prefix("host:transport:") {
-        let entry = lookup_online(snap, serial)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
-            format!("host:transport:{}", entry.upstream_serial),
-        ));
+    // Exact transport selectors MUST be checked before `host:transport:` /
+    // `host:tport:serial:` prefixes — otherwise `transport-any` becomes serial "any".
+    if service == "host:tport:any"
+        || service == "host:tport:usb"
+        || service == "host:tport:local"
+        || service == "host:transport-any"
+        || service == "host:transport-usb"
+        || service == "host:transport-local"
+    {
+        let entry = pick_preferred(snap)?;
+        let upstream = if service.starts_with("host:tport:") {
+            format!("host:tport:serial:{}", entry.upstream_serial)
+        } else {
+            format!("host:transport:{}", entry.upstream_serial)
+        };
+        return Ok((entry.backend_addr, entry.pair_code.clone(), upstream));
     }
 
-    // host:tport:serial:SERIAL
+    // host:tport:serial:SERIAL  (before generic transport:)
     if let Some(serial) = service.strip_prefix("host:tport:serial:") {
         let entry = lookup_online(snap, serial)?;
         return Ok((
@@ -104,15 +112,14 @@ fn route_service(
         ));
     }
 
-    // host:tport:any / host:transport-any
-    if service == "host:tport:any" || service == "host:transport-any" {
-        let entry = pick_preferred(snap)?;
-        let upstream = if service == "host:tport:any" {
-            format!("host:tport:serial:{}", entry.upstream_serial)
-        } else {
-            format!("host:transport:{}", entry.upstream_serial)
-        };
-        return Ok((entry.backend_addr, entry.pair_code.clone(), upstream));
+    // host:transport:SERIAL
+    if let Some(serial) = service.strip_prefix("host:transport:") {
+        let entry = lookup_online(snap, serial)?;
+        return Ok((
+            entry.backend_addr,
+            entry.pair_code.clone(),
+            format!("host:transport:{}", entry.upstream_serial),
+        ));
     }
 
     // host-serial:SERIAL:request…
@@ -128,13 +135,21 @@ fn route_service(
         ));
     }
 
-    // host:transport-usb / host:transport-local → same preference as "any"
-    if service == "host:transport-usb" || service == "host:transport-local" {
+    // host-usb:<request> / host-local:<request> — device-scoped without -s
+    if let Some(request) = service.strip_prefix("host-usb:") {
         let entry = pick_preferred(snap)?;
         return Ok((
             entry.backend_addr,
             entry.pair_code.clone(),
-            format!("host:transport:{}", entry.upstream_serial),
+            format!("host-serial:{}:{}", entry.upstream_serial, request),
+        ));
+    }
+    if let Some(request) = service.strip_prefix("host-local:") {
+        let entry = pick_preferred(snap)?;
+        return Ok((
+            entry.backend_addr,
+            entry.pair_code.clone(),
+            format!("host-serial:{}:{}", entry.upstream_serial, request),
         ));
     }
 
@@ -426,6 +441,43 @@ mod route_tests {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
         let err = route_service("host:tport:any", &snap, default, None).unwrap_err();
         assert!(err.contains("more than one"));
+    }
+
+    #[test]
+    fn transport_any_not_parsed_as_serial_any() {
+        // Regression: strip_prefix("host:transport:") used to turn this into serial "any".
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, code, svc) =
+            route_service("host:transport-any", &snap_one(), default, None).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(code.as_deref(), Some("ABCD1234"));
+        assert_eq!(svc, "host:transport:ABC");
+    }
+
+    #[test]
+    fn transport_usb_and_local_use_preferred() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (_, _, usb) = route_service("host:transport-usb", &snap_one(), default, None).unwrap();
+        let (_, _, local) =
+            route_service("host:transport-local", &snap_one(), default, None).unwrap();
+        assert_eq!(usb, "host:transport:ABC");
+        assert_eq!(local, "host:transport:ABC");
+    }
+
+    #[test]
+    fn host_usb_request_rewrites_to_host_serial() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, _, svc) =
+            route_service("host-usb:get-state", &snap_one(), default, None).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(svc, "host-serial:ABC:get-state");
+    }
+
+    #[test]
+    fn tport_usb_uses_preferred() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (_, _, svc) = route_service("host:tport:usb", &snap_one(), default, None).unwrap();
+        assert_eq!(svc, "host:tport:serial:ABC");
     }
 
     #[test]
