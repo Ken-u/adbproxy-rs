@@ -131,12 +131,14 @@ Each archive includes both `adb-proxy` and `adb-hub` (or `adb-hub.exe` on Window
 
 ## Automatic Releases
 
-Releases are driven by `Cargo.toml`:
+Releases are driven by `Cargo.toml` on pushes to `main`:
 
-1. Update `package.version`, for example `0.2.1`.
-2. Push to `main`.
+1. Update `package.version`, for example `0.2.4`.
+2. Push to `main` (do **not** push a `v*` tag yourself).
 3. GitHub Actions builds all platforms.
-4. If release `v0.2.1` does not already exist, the workflow creates tag `v0.2.1`, creates a GitHub Release, and uploads the archives.
+4. If release `v0.2.4` does not already exist, the workflow creates tag `v0.2.4`, creates a GitHub Release, and uploads the archives.
+
+Tag pushes no longer trigger CI (avoids duplicate runs when the workflow creates the tag).
 
 ## Development
 
