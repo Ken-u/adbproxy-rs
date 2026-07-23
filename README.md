@@ -15,7 +15,7 @@ adb-hub :5037  ----TCP---->  adb-proxy :5038  -->  adb server :5037  --> USB
                ----TCP---->  adb-proxy :5038  -->  adb server :5037  --> USB
 ```
 
-`adb-hub` speaks the ADB host protocol: it answers `host:devices` / `track-devices` from a merged registry, and on `host:transport:SERIAL` opens a connection to the owning backend and byte-pipes the rest (shell / sync / install / …).
+`adb-hub` speaks just enough of the ADB host protocol to merge device lists. Other host services (`features`, `version`, `tport`, `transport`, …) are forwarded as-is to the owning backend (or the default/local adb server).
 
 ## Device host (USB machine)
 
@@ -155,6 +155,7 @@ Implemented:
 - Protocol-aware `adb-hub` on `:5037` (client)
 - Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
+- Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend
 - `host:version`, `host:devices` / `devices-l`, `host:track-devices`, `host:transport:*`, `host:transport-any`, `host:kill`, `host-serial:*` forwarding
 - TOML config + legacy `~/.adbproxy` + CLI `--backend`
 

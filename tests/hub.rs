@@ -11,7 +11,7 @@ use adb_proxy::wait_for_port;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-/// Mock upstream adb server: answers devices-l and transport:SERIAL then echoes.
+/// Mock upstream: devices-l, version, features, transport, tport.
 async fn mock_backend(listener: TcpListener, serial: &'static str, extras: &'static str) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -31,9 +31,31 @@ async fn mock_backend(listener: TcpListener, serial: &'static str, extras: &'sta
                 let _ = write_okay_payload(&mut socket, body.as_bytes()).await;
                 return;
             }
+            if service == "host:version" {
+                let _ = write_okay_payload(&mut socket, b"0029").await;
+                return;
+            }
+            if service == "host:features" {
+                let _ = write_okay_payload(&mut socket, b"shell_v2,cmd").await;
+                return;
+            }
             if let Some(s) = service.strip_prefix("host:transport:") {
                 if s == serial {
                     let _ = write_okay(&mut socket).await;
+                    if let Ok(payload) = read_packet(&mut socket).await {
+                        let _ = write_packet(&mut socket, &payload).await;
+                    }
+                } else {
+                    let _ = write_fail(&mut socket, "unknown device").await;
+                }
+                return;
+            }
+            if let Some(s) = service.strip_prefix("host:tport:serial:") {
+                if s == serial {
+                    let _ = write_okay(&mut socket).await;
+                    // 8-byte transport id
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, &[1, 0, 0, 0, 0, 0, 0, 0])
+                        .await;
                     if let Ok(payload) = read_packet(&mut socket).await {
                         let _ = write_packet(&mut socket, &payload).await;
                     }
@@ -48,7 +70,7 @@ async fn mock_backend(listener: TcpListener, serial: &'static str, extras: &'sta
 }
 
 #[tokio::test]
-async fn hub_lists_and_transports() {
+async fn hub_lists_forwards_and_transports() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
     tokio::spawn(mock_backend(backend_listener, "SERIAL1", "product:test"));
@@ -84,6 +106,7 @@ async fn hub_lists_and_transports() {
     wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
 
+    // version is forwarded to backend
     {
         let mut c = TcpStream::connect(hub_addr).await.unwrap();
         write_service(&mut c, "host:version").await.unwrap();
@@ -91,6 +114,15 @@ async fn hub_lists_and_transports() {
         assert_eq!(body, b"0029");
     }
 
+    // features is forwarded (was previously unsupported)
+    {
+        let mut c = TcpStream::connect(hub_addr).await.unwrap();
+        write_service(&mut c, "host:features").await.unwrap();
+        let body = read_okay_payload(&mut c).await.unwrap();
+        assert_eq!(body, b"shell_v2,cmd");
+    }
+
+    // devices is aggregated by hub
     {
         let mut c = TcpStream::connect(hub_addr).await.unwrap();
         write_service(&mut c, "host:devices").await.unwrap();
@@ -99,6 +131,7 @@ async fn hub_lists_and_transports() {
         assert!(text.contains("SERIAL1\tdevice"), "got: {text}");
     }
 
+    // transport still works via full forward
     {
         let mut c = TcpStream::connect(hub_addr).await.unwrap();
         write_service(&mut c, "host:transport:SERIAL1").await.unwrap();
@@ -107,6 +140,22 @@ async fn hub_lists_and_transports() {
         write_packet(&mut c, b"shell:echo").await.unwrap();
         let echoed = read_packet(&mut c).await.unwrap();
         assert_eq!(echoed, b"shell:echo");
+    }
+
+    // tport:any rewritten and forwarded
+    {
+        let mut c = TcpStream::connect(hub_addr).await.unwrap();
+        write_service(&mut c, "host:tport:any").await.unwrap();
+        let status = read_status(&mut c).await.unwrap();
+        assert_eq!(&status, b"OKAY");
+        let mut tid = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(&mut c, &mut tid)
+            .await
+            .unwrap();
+        assert_eq!(tid[0], 1);
+        write_packet(&mut c, b"shell:hi").await.unwrap();
+        let echoed = read_packet(&mut c).await.unwrap();
+        assert_eq!(echoed, b"shell:hi");
     }
 
     let _ = shutdown_tx.send(());

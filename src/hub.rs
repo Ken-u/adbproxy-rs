@@ -93,6 +93,7 @@ pub async fn run_hub_with_shutdown(
         info!(name = %b.name, addr = %b.addr, "backend configured");
     }
 
+    let default_backend = config.backends[0].addr;
     let registry = DeviceRegistry::new();
     let kill_notify = Arc::new(Notify::new());
 
@@ -123,7 +124,7 @@ pub async fn run_hub_with_shutdown(
                 info!(client = %client_addr, "client connected");
                 let ctx = SessionContext {
                     registry: registry.clone(),
-                    adb_version: config.adb_version,
+                    default_backend,
                     kill_notify: kill_notify.clone(),
                 };
                 tokio::spawn(async move {

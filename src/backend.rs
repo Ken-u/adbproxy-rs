@@ -40,35 +40,6 @@ pub async fn fetch_devices_l(addr: std::net::SocketAddr) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Open a transport to `upstream_serial` on the given backend.
-/// On success the stream is bound and ready for device services.
-pub async fn open_transport(
-    addr: std::net::SocketAddr,
-    upstream_serial: &str,
-) -> io::Result<TcpStream> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let service = format!("host:transport:{upstream_serial}");
-    write_service(&mut stream, &service).await?;
-    let status = crate::protocol::read_status(&mut stream).await?;
-    match &status {
-        b"OKAY" => Ok(stream),
-        b"FAIL" => {
-            let reason = crate::protocol::read_packet(&mut stream).await?;
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                String::from_utf8_lossy(&reason).into_owned(),
-            ))
-        }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unexpected transport status: {:?}",
-                std::str::from_utf8(other).unwrap_or("?")
-            ),
-        )),
-    }
-}
-
 pub async fn run_backend_poller(config: HubConfig, registry: DeviceRegistry) {
     loop {
         let mut lists: Vec<(BackendConfig, String)> = Vec::new();

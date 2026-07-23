@@ -1,4 +1,5 @@
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::copy_bidirectional;
@@ -6,23 +7,25 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
 
-use crate::backend::open_transport;
 use crate::protocol::{
     read_packet, write_fail, write_okay, write_okay_payload, write_packet, write_service,
 };
-use crate::registry::DeviceRegistry;
+use crate::registry::{DeviceEntry, DeviceRegistry, DeviceSnapshot};
 
 pub struct SessionContext {
     pub registry: DeviceRegistry,
-    pub adb_version: u32,
+    /// Backend used for host services without a device serial (features, version, …).
+    pub default_backend: SocketAddr,
     pub kill_notify: Arc<Notify>,
 }
 
 /// Handle one adb client connection.
 ///
-/// Real adb servers close the socket after one-shot host queries (`host:version`,
-/// `host:devices`, …). Keeping the connection open makes official clients hang
-/// waiting for EOF after reading the response.
+/// Policy:
+/// - `host:devices` / `track-devices` → answer from aggregated registry
+/// - `host:kill` → stop the hub
+/// - services that name a serial → rewrite serial if needed, forward whole session
+/// - everything else → forward whole session to the default backend
 pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Result<()> {
     let payload = match read_packet(&mut client).await {
         Ok(p) => p,
@@ -39,12 +42,6 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
     };
 
     debug!(service = %service, "host service");
-
-    if service == "host:version" {
-        let ver = format!("{:04x}", ctx.adb_version);
-        write_okay_payload(&mut client, ver.as_bytes()).await?;
-        return Ok(());
-    }
 
     if service == "host:devices" || service == "host:devices-l" {
         let long = service.ends_with("-l");
@@ -64,74 +61,123 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
         return Ok(());
     }
 
-    if let Some(serial) = service.strip_prefix("host:transport:") {
-        return bind_transport(&mut client, &ctx, serial).await;
+    let snap = ctx.registry.snapshot().await;
+    match route_service(&service, &snap, ctx.default_backend) {
+        Ok((addr, upstream_service)) => {
+            debug!(%addr, service = %upstream_service, "forwarding to backend");
+            forward_session(&mut client, addr, &upstream_service).await
+        }
+        Err(reason) => {
+            write_fail(&mut client, &reason).await?;
+            Ok(())
+        }
     }
-
-    if service == "host:transport-any" {
-        let snap = ctx.registry.snapshot().await;
-        let online: Vec<_> = snap
-            .devices
-            .iter()
-            .filter(|d| d.state == "device")
-            .collect();
-        return match online.len() {
-            0 => {
-                write_fail(&mut client, "no devices/emulators found").await?;
-                Ok(())
-            }
-            1 => bind_transport(&mut client, &ctx, &online[0].public_serial).await,
-            _ => {
-                write_fail(&mut client, "more than one device/emulator").await?;
-                Ok(())
-            }
-        };
-    }
-
-    if let Some(rest) = service.strip_prefix("host-serial:") {
-        return forward_host_serial(&mut client, &ctx, rest).await;
-    }
-
-    write_fail(
-        &mut client,
-        &format!("adb-hub: unsupported service '{service}'"),
-    )
-    .await?;
-    Ok(())
 }
 
-async fn bind_transport(
-    client: &mut TcpStream,
-    ctx: &SessionContext,
-    public_serial: &str,
-) -> io::Result<()> {
-    let snap = ctx.registry.snapshot().await;
-    let Some(entry) = snap.find(public_serial) else {
-        write_fail(client, &format!("device '{public_serial}' not found")).await?;
-        return Ok(());
-    };
+/// Decide which backend gets this service and what service string to send upstream.
+fn route_service(
+    service: &str,
+    snap: &DeviceSnapshot,
+    default_backend: SocketAddr,
+) -> Result<(SocketAddr, String), String> {
+    // host:transport:SERIAL
+    if let Some(serial) = service.strip_prefix("host:transport:") {
+        let entry = lookup_online(snap, serial)?;
+        return Ok((
+            entry.backend_addr,
+            format!("host:transport:{}", entry.upstream_serial),
+        ));
+    }
 
-    let upstream = match open_transport(entry.backend_addr, &entry.upstream_serial).await {
+    // host:tport:serial:SERIAL
+    if let Some(serial) = service.strip_prefix("host:tport:serial:") {
+        let entry = lookup_online(snap, serial)?;
+        return Ok((
+            entry.backend_addr,
+            format!("host:tport:serial:{}", entry.upstream_serial),
+        ));
+    }
+
+    // host:tport:any / host:transport-any
+    if service == "host:tport:any" || service == "host:transport-any" {
+        let entry = pick_any(snap)?;
+        let upstream = if service == "host:tport:any" {
+            format!("host:tport:serial:{}", entry.upstream_serial)
+        } else {
+            format!("host:transport:{}", entry.upstream_serial)
+        };
+        return Ok((entry.backend_addr, upstream));
+    }
+
+    // host-serial:SERIAL:request…
+    if let Some(rest) = service.strip_prefix("host-serial:") {
+        let Some((serial, request)) = rest.split_once(':') else {
+            return Err("invalid host-serial service".into());
+        };
+        let entry = lookup_device(snap, serial)?;
+        return Ok((
+            entry.backend_addr,
+            format!("host-serial:{}:{}", entry.upstream_serial, request),
+        ));
+    }
+
+    // host:transport-usb / host:transport-local → treat like any against filtered set
+    if service == "host:transport-usb" || service == "host:transport-local" {
+        let entry = pick_any(snap)?;
+        return Ok((
+            entry.backend_addr,
+            format!("host:transport:{}", entry.upstream_serial),
+        ));
+    }
+
+    // Default: opaque forward to the default backend (local adb or first remote).
+    Ok((default_backend, service.to_string()))
+}
+
+fn lookup_device<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'a DeviceEntry, String> {
+    snap.find(public_serial)
+        .ok_or_else(|| format!("device '{public_serial}' not found"))
+}
+
+fn lookup_online<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'a DeviceEntry, String> {
+    let entry = lookup_device(snap, public_serial)?;
+    if entry.state != "device" {
+        return Err(format!("device '{public_serial}' is not online ({})", entry.state));
+    }
+    Ok(entry)
+}
+
+fn pick_any(snap: &DeviceSnapshot) -> Result<&DeviceEntry, String> {
+    let online: Vec<_> = snap
+        .devices
+        .iter()
+        .filter(|d| d.state == "device")
+        .collect();
+    match online.len() {
+        0 => Err("no devices/emulators found".into()),
+        1 => Ok(online[0]),
+        _ => Err("more than one device/emulator".into()),
+    }
+}
+
+async fn forward_session(
+    client: &mut TcpStream,
+    addr: SocketAddr,
+    service: &str,
+) -> io::Result<()> {
+    let mut upstream = match TcpStream::connect(addr).await {
         Ok(s) => s,
         Err(err) => {
-            write_fail(client, &err.to_string()).await?;
+            write_fail(client, &format!("backend {addr}: {err}")).await?;
             return Ok(());
         }
     };
-
-    write_okay(client).await?;
-    debug!(
-        serial = %public_serial,
-        backend = %entry.backend_name,
-        "transport bound; piping"
-    );
-
-    let mut upstream = upstream;
+    write_service(&mut upstream, service).await?;
     match copy_bidirectional(client, &mut upstream).await {
         Ok(_) => Ok(()),
         Err(err) if is_benign(&err) => Ok(()),
         Err(err) => {
-            warn!(error = %err, "transport pipe error");
+            warn!(%addr, service, error = %err, "forward pipe error");
             Err(err)
         }
     }
@@ -168,33 +214,6 @@ async fn track_devices(
     }
 }
 
-async fn forward_host_serial(
-    client: &mut TcpStream,
-    ctx: &SessionContext,
-    rest: &str,
-) -> io::Result<()> {
-    let Some((public_serial, request)) = rest.split_once(':') else {
-        write_fail(client, "invalid host-serial service").await?;
-        return Ok(());
-    };
-
-    let snap = ctx.registry.snapshot().await;
-    let Some(entry) = snap.find(public_serial) else {
-        write_fail(client, &format!("device '{public_serial}' not found")).await?;
-        return Ok(());
-    };
-
-    let upstream_service = format!("host-serial:{}:{}", entry.upstream_serial, request);
-    let mut upstream = TcpStream::connect(entry.backend_addr).await?;
-    write_service(&mut upstream, &upstream_service).await?;
-
-    match tokio::io::copy(&mut upstream, client).await {
-        Ok(_) => Ok(()),
-        Err(err) if is_benign(&err) => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 fn is_benign(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -203,4 +222,57 @@ fn is_benign(err: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::UnexpectedEof
     )
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::registry::DeviceEntry;
+
+    fn snap_one() -> DeviceSnapshot {
+        DeviceSnapshot {
+            devices: vec![DeviceEntry {
+                public_serial: "office:ABC".into(),
+                upstream_serial: "ABC".into(),
+                state: "device".into(),
+                extras: String::new(),
+                backend_name: "office".into(),
+                backend_addr: "10.0.0.1:5038".parse().unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn rewrites_transport_serial() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) =
+            route_service("host:transport:office:ABC", &snap_one(), default).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(svc, "host:transport:ABC");
+    }
+
+    #[test]
+    fn rewrites_tport_serial() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) =
+            route_service("host:tport:serial:office:ABC", &snap_one(), default).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(svc, "host:tport:serial:ABC");
+    }
+
+    #[test]
+    fn tport_any_becomes_serial() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) = route_service("host:tport:any", &snap_one(), default).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(svc, "host:tport:serial:ABC");
+    }
+
+    #[test]
+    fn features_goes_to_default() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) = route_service("host:features", &snap_one(), default).unwrap();
+        assert_eq!(addr, default);
+        assert_eq!(svc, "host:features");
+    }
 }
