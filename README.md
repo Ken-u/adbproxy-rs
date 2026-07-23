@@ -2,7 +2,7 @@
 
 This repository provides two binaries:
 
-1. **`adb-proxy`** — transparent TCP proxy on the machine that has USB devices
+1. **`adb-proxy`** — TCP proxy on the machine that has USB devices (pair-code auth required)
 2. **`adb-hub`** — local ADB-protocol server on the client machine (`127.0.0.1:5037`) that aggregates multiple remote `adb-proxy` backends
 
 ```text
@@ -17,11 +17,14 @@ adb-hub :5037  ----TCP---->  adb-proxy :5038  -->  adb server :5037  --> USB
 
 `adb-hub` speaks just enough of the ADB host protocol to merge device lists. Other host services (`features`, `version`, `tport`, `transport`, …) are forwarded as-is to the owning backend (or the default/local adb server).
 
+Remote `adb-proxy` instances require an 8-character pair code (`A-Z0-9`) on every connection. The port may be open on the LAN, but ADB traffic is rejected until the hub authenticates with the matching code.
+
 ## Device host (USB machine)
 
 ```bash
 adb start-server
 adb devices
+# pair code is printed at startup (or set ADB_PROXY_PAIR_CODE / --pair-code)
 cargo run --bin adb-proxy -- --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 ```
 
@@ -29,23 +32,33 @@ Or with a release binary:
 
 ```bash
 adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037
+# optional fixed code for reconnects:
+# ADB_PROXY_PAIR_CODE=ABCD1234 adb-proxy ...
 ```
 
 ## Client (your laptop)
 
-Stop any local adb server that already owns `:5037`, then start the hub:
+Stop any local adb server that already owns `:5037`, then pair and start the hub:
 
 ```bash
 adb kill-server
 
-# CLI backends
-adb-hub --backend office=192.168.1.10:5038 --backend lab=192.168.1.11:5038
+# Pair with a remote proxy (writes ~/.config/adb-hub/config.toml)
+adb-hub pair 192.168.1.10:5038 ABCD1234 --name office
+adb-hub pair 192.168.1.11:5038 EFGH5678 --name lab
 
-# or TOML config
+# Start hub (loads paired backends from config)
+adb-hub
+```
+
+You can still pass backends on the CLI (without a pair code they cannot talk to an auth-gated proxy):
+
+```bash
+adb-hub --backend office=192.168.1.10:5038
 adb-hub --config ~/.config/adb-hub/config.toml
 ```
 
-Example config:
+Example config after pairing:
 
 ```toml
 listen = "127.0.0.1:5037"
@@ -56,13 +69,15 @@ local_adb_port = 5039
 [[backend]]
 name = "office"
 addr = "192.168.1.10:5038"
+pair_code = "ABCD1234"
 
 [[backend]]
 name = "lab"
 addr = "192.168.1.11:5038"
+pair_code = "EFGH5678"
 ```
 
-By default `adb-hub` also starts a real local `adb` server on `local_adb_port` (5039), frees `:5037` for itself, and aggregates local USB devices as backend `local` together with remotes. Use `--no-local` to disable.
+By default `adb-hub` also starts a real local `adb` server on `local_adb_port` (5039), frees `:5037` for itself, and aggregates local USB devices as backend `local` together with remotes. Use `--no-local` to disable. The local backend does not use pair-code auth.
 
 Then use the original `adb` as usual (no `-H` / `-P`, no PATH wrapper):
 
@@ -102,17 +117,23 @@ Install directory override: `ADB_PROXY_INSTALL_DIR=~/bin`.
 adb-proxy \
   --listen 0.0.0.0:5038 \
   --target 127.0.0.1:5037 \
+  --pair-code ABCD1234 \
   --log-level info
 ```
 
-Env: `ADB_PROXY_LISTEN`, `ADB_PROXY_TARGET`, `ADB_PROXY_LOG`.
+Env: `ADB_PROXY_LISTEN`, `ADB_PROXY_TARGET`, `ADB_PROXY_PAIR_CODE`, `ADB_PROXY_LOG`.
+
+If `--pair-code` / `ADB_PROXY_PAIR_CODE` is omitted, a random 8-character `A-Z0-9` code is generated and logged at startup.
 
 ### adb-hub (client)
 
 ```bash
+# Pair once
+adb-hub pair 192.168.1.10:5038 ABCD1234 --name office
+
+# Run hub
 adb-hub \
   --listen 127.0.0.1:5037 \
-  --backend office=192.168.1.10:5038 \
   --log-level info
 ```
 
@@ -145,16 +166,18 @@ Tag pushes no longer trigger CI (avoids duplicate runs when the workflow creates
 ```bash
 cargo test
 cargo build --bins
-cargo run --bin adb-proxy -- --listen 0.0.0.0:5038 --target 127.0.0.1:5037
-cargo run --bin adb-hub -- --backend mock=127.0.0.1:5038
+cargo run --bin adb-proxy -- --listen 0.0.0.0:5038 --target 127.0.0.1:5037 --pair-code ABCD1234
+cargo run --bin adb-hub -- pair 127.0.0.1:5038 ABCD1234 --name mock
+cargo run --bin adb-hub -- --no-local
 ```
 
 ## Scope
 
 Implemented:
 
-- Transparent TCP `adb-proxy` (device host)
+- TCP `adb-proxy` with pair-code auth on every connection (device host)
 - Protocol-aware `adb-hub` on `:5037` (client)
+- `adb-hub pair <host:port> <code> [--name]` persists backends + pair codes
 - Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
 - Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend
@@ -163,6 +186,5 @@ Implemented:
 
 Not in this phase:
 
-- LAN auto-discovery / `adb pair`
-- Auth / ACL
+- LAN auto-discovery
 - Sharing `:5037` with a separately started default adb server (hub relocates local adb to `local_adb_port`)

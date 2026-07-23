@@ -1,18 +1,23 @@
 use std::net::SocketAddr;
 
+use adb_proxy::auth::{generate_pair_code, validate_pair_code};
 use adb_proxy::{run_proxy, ProxyConfig};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "adb-proxy")]
-#[command(about = "Transparent TCP proxy for remote adb server access")]
+#[command(about = "TCP proxy for remote adb server access (pair-code auth required)")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:5038", env = "ADB_PROXY_LISTEN")]
     listen: SocketAddr,
 
     #[arg(long, default_value = "127.0.0.1:5037", env = "ADB_PROXY_TARGET")]
     target: SocketAddr,
+
+    /// 8-character A-Z0-9 pair code (default: random each start)
+    #[arg(long, env = "ADB_PROXY_PAIR_CODE")]
+    pair_code: Option<String>,
 
     #[arg(long, default_value = "info", env = "ADB_PROXY_LOG")]
     log_level: String,
@@ -23,9 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     init_tracing(&args.log_level);
 
+    let pair_code = match args.pair_code {
+        Some(code) => {
+            validate_pair_code(&code).map_err(|e| format!("invalid --pair-code: {e}"))?;
+            code
+        }
+        None => generate_pair_code(),
+    };
+
     run_proxy(ProxyConfig {
         listen: args.listen,
         target: args.target,
+        pair_code,
     })
     .await?;
 

@@ -47,7 +47,7 @@ pub async fn run_hub_with_shutdown(
             .await
             .map_err(HubError::LocalAdb)?;
         // Match the real adb server's ADB_SERVER_VERSION so clients don't kill us.
-        match fetch_server_version(local.addr).await {
+        match fetch_server_version(local.addr, None).await {
             Ok(v) => {
                 info!(adb_version = v, "synced hub version from local adb server");
                 config.adb_version = v;
@@ -59,6 +59,7 @@ pub async fn run_hub_with_shutdown(
         let local_backend = BackendConfig {
             name: LocalAdb::backend_name().to_string(),
             addr: local.addr,
+            pair_code: None,
         };
         config
             .backends
@@ -94,6 +95,7 @@ pub async fn run_hub_with_shutdown(
     }
 
     let default_backend = config.backends[0].addr;
+    let default_pair_code = config.backends[0].pair_code.clone();
     let registry = DeviceRegistry::new();
     let kill_notify = Arc::new(Notify::new());
 
@@ -125,6 +127,7 @@ pub async fn run_hub_with_shutdown(
                 let ctx = SessionContext {
                     registry: registry.clone(),
                     default_backend,
+                    default_pair_code: default_pair_code.clone(),
                     kill_notify: kill_notify.clone(),
                 };
                 tokio::spawn(async move {

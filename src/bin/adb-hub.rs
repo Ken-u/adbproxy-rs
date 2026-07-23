@@ -2,23 +2,29 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
 
+use adb_proxy::auth::{authenticate_stream, validate_pair_code};
 use adb_proxy::config::{
-    default_config_path, legacy_config_path, parse_backend_arg, BackendConfig, HubConfig,
+    default_backend_name, default_config_path, legacy_config_path, parse_backend_arg,
+    BackendConfig, HubConfig,
 };
 use adb_proxy::hub::run_hub_with_shutdown;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "adb-hub")]
 #[command(about = "Local adb server that aggregates local USB + remote adb-proxy backends")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Listen address (default 127.0.0.1:5037)
-    #[arg(long, env = "ADB_HUB_LISTEN")]
+    #[arg(long, env = "ADB_HUB_LISTEN", global = true)]
     listen: Option<SocketAddr>,
 
     /// Path to TOML config (default ~/.config/adb-hub/config.toml)
-    #[arg(long, env = "ADB_HUB_CONFIG")]
+    #[arg(long, env = "ADB_HUB_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Backend as name=host:port or host:port (repeatable; overrides config backends)
@@ -37,14 +43,36 @@ struct Args {
     #[arg(long, env = "ADB_HUB_LOCAL_PORT")]
     local_port: Option<u16>,
 
-    #[arg(long, default_value = "info", env = "ADB_HUB_LOG")]
+    #[arg(long, default_value = "info", env = "ADB_HUB_LOG", global = true)]
     log_level: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Pair with a remote adb-proxy and save it to the hub config
+    Pair {
+        /// adb-proxy address (host:port)
+        addr: SocketAddr,
+        /// 8-character A-Z0-9 pair code shown by adb-proxy
+        code: String,
+        /// Backend name stored in config (default derived from addr)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     init_tracing(&args.log_level);
+
+    if let Some(Commands::Pair { addr, code, name }) = args.command {
+        if let Err(err) = run_pair(addr, &code, name.as_deref(), args.config.as_ref()).await {
+            eprintln!("adb-hub pair error: {err}");
+            process::exit(1);
+        }
+        return;
+    }
 
     let config = match build_config(&args) {
         Ok(c) => c,
@@ -62,6 +90,42 @@ async fn main() {
         eprintln!("adb-hub error: {err}");
         process::exit(1);
     }
+}
+
+async fn run_pair(
+    addr: SocketAddr,
+    code: &str,
+    name: Option<&str>,
+    config_path: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_pair_code(code)?;
+
+    let mut stream = TcpStream::connect(addr).await?;
+    authenticate_stream(&mut stream, code).await?;
+    drop(stream);
+
+    let path = config_path.cloned().unwrap_or_else(default_config_path);
+    let mut config = if path.is_file() {
+        HubConfig::load_file(&path)?
+    } else {
+        HubConfig::local_only()
+    };
+
+    let backend_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| default_backend_name(addr));
+    config.upsert_backend(BackendConfig {
+        name: backend_name.clone(),
+        addr,
+        pair_code: Some(code.to_string()),
+    });
+    config.save_file(&path)?;
+
+    println!(
+        "paired backend '{backend_name}' at {addr} (pair_code saved to {})",
+        path.display()
+    );
+    Ok(())
 }
 
 fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {

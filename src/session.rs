@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
 
+use crate::auth::authenticate_stream;
 use crate::protocol::{
     read_packet, write_fail, write_okay, write_okay_payload, write_packet, write_service,
 };
@@ -16,6 +17,7 @@ pub struct SessionContext {
     pub registry: DeviceRegistry,
     /// Backend used for host services without a device serial (features, version, …).
     pub default_backend: SocketAddr,
+    pub default_pair_code: Option<String>,
     pub kill_notify: Arc<Notify>,
 }
 
@@ -63,10 +65,10 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
     }
 
     let snap = ctx.registry.snapshot().await;
-    match route_service(&service, &snap, ctx.default_backend) {
-        Ok((addr, upstream_service)) => {
+    match route_service(&service, &snap, ctx.default_backend, ctx.default_pair_code.as_deref()) {
+        Ok((addr, pair_code, upstream_service)) => {
             debug!(%addr, service = %upstream_service, "forwarding to backend");
-            forward_session(&mut client, addr, &upstream_service).await
+            forward_session(&mut client, addr, pair_code.as_deref(), &upstream_service).await
         }
         Err(reason) => {
             write_fail(&mut client, &reason).await?;
@@ -80,12 +82,14 @@ fn route_service(
     service: &str,
     snap: &DeviceSnapshot,
     default_backend: SocketAddr,
-) -> Result<(SocketAddr, String), String> {
+    default_pair_code: Option<&str>,
+) -> Result<(SocketAddr, Option<String>, String), String> {
     // host:transport:SERIAL
     if let Some(serial) = service.strip_prefix("host:transport:") {
         let entry = lookup_online(snap, serial)?;
         return Ok((
             entry.backend_addr,
+            entry.pair_code.clone(),
             format!("host:transport:{}", entry.upstream_serial),
         ));
     }
@@ -95,6 +99,7 @@ fn route_service(
         let entry = lookup_online(snap, serial)?;
         return Ok((
             entry.backend_addr,
+            entry.pair_code.clone(),
             format!("host:tport:serial:{}", entry.upstream_serial),
         ));
     }
@@ -107,7 +112,7 @@ fn route_service(
         } else {
             format!("host:transport:{}", entry.upstream_serial)
         };
-        return Ok((entry.backend_addr, upstream));
+        return Ok((entry.backend_addr, entry.pair_code.clone(), upstream));
     }
 
     // host-serial:SERIAL:request…
@@ -118,6 +123,7 @@ fn route_service(
         let entry = lookup_device(snap, serial)?;
         return Ok((
             entry.backend_addr,
+            entry.pair_code.clone(),
             format!("host-serial:{}:{}", entry.upstream_serial, request),
         ));
     }
@@ -127,12 +133,17 @@ fn route_service(
         let entry = pick_preferred(snap)?;
         return Ok((
             entry.backend_addr,
+            entry.pair_code.clone(),
             format!("host:transport:{}", entry.upstream_serial),
         ));
     }
 
     // Default: opaque forward to the default backend (local adb or first remote).
-    Ok((default_backend, service.to_string()))
+    Ok((
+        default_backend,
+        default_pair_code.map(str::to_string),
+        service.to_string(),
+    ))
 }
 
 fn lookup_device<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'a DeviceEntry, String> {
@@ -212,6 +223,7 @@ fn pick_one_on_backend<'a>(
 async fn forward_session(
     client: &mut TcpStream,
     addr: SocketAddr,
+    pair_code: Option<&str>,
     service: &str,
 ) -> io::Result<()> {
     let mut upstream = match TcpStream::connect(addr).await {
@@ -221,6 +233,12 @@ async fn forward_session(
             return Ok(());
         }
     };
+    if let Some(code) = pair_code {
+        if let Err(err) = authenticate_stream(&mut upstream, code).await {
+            write_fail(client, &format!("backend {addr} auth: {err}")).await?;
+            return Ok(());
+        }
+    }
     write_service(&mut upstream, service).await?;
     match copy_bidirectional(client, &mut upstream).await {
         Ok(_) => Ok(()),
@@ -287,6 +305,7 @@ mod route_tests {
                 extras: String::new(),
                 backend_name: "office".into(),
                 backend_addr: "10.0.0.1:5038".parse().unwrap(),
+                pair_code: Some("ABCD1234".into()),
             }],
         }
     }
@@ -294,17 +313,18 @@ mod route_tests {
     #[test]
     fn rewrites_transport_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) =
-            route_service("host:transport:office:ABC", &snap_one(), default).unwrap();
+        let (addr, code, svc) =
+            route_service("host:transport:office:ABC", &snap_one(), default, None).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host:transport:ABC");
     }
 
     #[test]
     fn rewrites_tport_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) =
-            route_service("host:tport:serial:office:ABC", &snap_one(), default).unwrap();
+        let (addr, _, svc) =
+            route_service("host:tport:serial:office:ABC", &snap_one(), default, None).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host:tport:serial:ABC");
     }
@@ -312,7 +332,7 @@ mod route_tests {
     #[test]
     fn tport_any_becomes_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) = route_service("host:tport:any", &snap_one(), default).unwrap();
+        let (addr, _, svc) = route_service("host:tport:any", &snap_one(), default, None).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host:tport:serial:ABC");
     }
@@ -328,6 +348,7 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                    pair_code: None,
                 },
                 DeviceEntry {
                     public_serial: "REMOTE1".into(),
@@ -336,12 +357,14 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "office".into(),
                     backend_addr: "10.0.0.1:5038".parse().unwrap(),
+                    pair_code: Some("ABCD1234".into()),
                 },
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) = route_service("host:tport:any", &snap, default).unwrap();
+        let (addr, code, svc) = route_service("host:tport:any", &snap, default, None).unwrap();
         assert_eq!(addr.to_string(), "127.0.0.1:5039");
+        assert!(code.is_none());
         assert_eq!(svc, "host:tport:serial:LOCAL1");
     }
 
@@ -356,6 +379,7 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "office".into(),
                     backend_addr: "10.0.0.1:5038".parse().unwrap(),
+                    pair_code: Some("CODE1111".into()),
                 },
                 DeviceEntry {
                     public_serial: "REMOTE2".into(),
@@ -364,12 +388,14 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "lab".into(),
                     backend_addr: "10.0.0.2:5038".parse().unwrap(),
+                    pair_code: Some("CODE2222".into()),
                 },
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) = route_service("host:transport-any", &snap, default).unwrap();
+        let (addr, code, svc) = route_service("host:transport-any", &snap, default, None).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(code.as_deref(), Some("CODE1111"));
         assert_eq!(svc, "host:transport:REMOTE1");
     }
 
@@ -384,6 +410,7 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                    pair_code: None,
                 },
                 DeviceEntry {
                     public_serial: "L2".into(),
@@ -392,19 +419,22 @@ mod route_tests {
                     extras: String::new(),
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                    pair_code: None,
                 },
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let err = route_service("host:tport:any", &snap, default).unwrap_err();
+        let err = route_service("host:tport:any", &snap, default, None).unwrap_err();
         assert!(err.contains("more than one"));
     }
 
     #[test]
     fn features_goes_to_default() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, svc) = route_service("host:features", &snap_one(), default).unwrap();
+        let (addr, code, svc) =
+            route_service("host:features", &snap_one(), default, Some("LOCALCODE")).unwrap();
         assert_eq!(addr, default);
+        assert_eq!(code.as_deref(), Some("LOCALCODE"));
         assert_eq!(svc, "host:features");
     }
 }

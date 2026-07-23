@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod hub;
@@ -17,10 +18,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
+use crate::auth::accept_auth;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyConfig {
     pub listen: SocketAddr,
     pub target: SocketAddr,
+    /// 8-character A-Z0-9 pair code required on every client connection.
+    pub pair_code: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +57,13 @@ pub async fn run_proxy_with_shutdown(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
-    info!(listen = %config.listen, target = %config.target, "adb-proxy listening");
+    info!(
+        listen = %config.listen,
+        target = %config.target,
+        pair_code = %config.pair_code,
+        "adb-proxy listening (pair with: adb-hub pair <host:port> {})",
+        config.pair_code
+    );
 
     tokio::pin!(shutdown);
 
@@ -65,11 +76,15 @@ pub async fn run_proxy_with_shutdown(
             accepted = listener.accept() => {
                 let (client, client_addr) = accepted?;
                 let target = config.target;
+                let pair_code = config.pair_code.clone();
                 info!(client = %client_addr, target = %target, "client connected");
 
                 tokio::spawn(async move {
-                    match proxy_connection(client, client_addr, target).await {
-                        Ok(stats) => {
+                    match proxy_connection(client, client_addr, target, &pair_code).await {
+                        Ok(None) => {
+                            info!(client = %client_addr, "client rejected (auth)");
+                        }
+                        Ok(Some(stats)) => {
                             info!(
                                 client = %stats.client_addr,
                                 target = %stats.target_addr,
@@ -114,21 +129,26 @@ async fn proxy_connection(
     mut client: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
-) -> Result<ProxyStats> {
+    pair_code: &str,
+) -> Result<Option<ProxyStats>> {
     let started = Instant::now();
+    if !accept_auth(&mut client, pair_code).await? {
+        return Ok(None);
+    }
+
     let mut upstream = TcpStream::connect(target_addr).await?;
     debug!(client = %client_addr, target = %target_addr, "upstream connected");
 
     let (bytes_client_to_server, bytes_server_to_client) =
         copy_bidirectional(&mut client, &mut upstream).await?;
 
-    Ok(ProxyStats {
+    Ok(Some(ProxyStats {
         client_addr,
         target_addr,
         bytes_client_to_server,
         bytes_server_to_client,
         duration: started.elapsed(),
-    })
+    }))
 }
 
 fn is_expected_disconnect(err: &ProxyError) -> bool {

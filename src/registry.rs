@@ -17,6 +17,7 @@ pub struct DeviceEntry {
     pub extras: String,
     pub backend_name: String,
     pub backend_addr: SocketAddr,
+    pub pair_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -153,6 +154,7 @@ pub fn merge_device_lists(lists: &[(BackendConfig, String)]) -> DeviceSnapshot {
             extras,
             backend_name: backend.name.clone(),
             backend_addr: backend.addr,
+            pair_code: backend.pair_code.clone(),
         });
     }
 
@@ -167,6 +169,7 @@ mod tests {
         BackendConfig {
             name: name.into(),
             addr: addr.parse().unwrap(),
+            pair_code: None,
         }
     }
 
@@ -217,6 +220,7 @@ mod tests {
                 extras: "product:foo".into(),
                 backend_name: "a".into(),
                 backend_addr: "1.1.1.1:1".parse().unwrap(),
+                pair_code: None,
             }],
         };
         assert_eq!(snap.format_devices(false), "X\tdevice\n");
