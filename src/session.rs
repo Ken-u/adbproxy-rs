@@ -25,6 +25,7 @@ pub struct SessionContext {
 /// - `host:devices` / `track-devices` → answer from aggregated registry
 /// - `host:kill` → stop the hub
 /// - services that name a serial → rewrite serial if needed, forward whole session
+/// - `tport:any` / `transport-any` → prefer local backend, else first backend with a device
 /// - everything else → forward whole session to the default backend
 pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Result<()> {
     let payload = match read_packet(&mut client).await {
@@ -100,7 +101,7 @@ fn route_service(
 
     // host:tport:any / host:transport-any
     if service == "host:tport:any" || service == "host:transport-any" {
-        let entry = pick_any(snap)?;
+        let entry = pick_preferred(snap)?;
         let upstream = if service == "host:tport:any" {
             format!("host:tport:serial:{}", entry.upstream_serial)
         } else {
@@ -121,9 +122,9 @@ fn route_service(
         ));
     }
 
-    // host:transport-usb / host:transport-local → treat like any against filtered set
+    // host:transport-usb / host:transport-local → same preference as "any"
     if service == "host:transport-usb" || service == "host:transport-local" {
-        let entry = pick_any(snap)?;
+        let entry = pick_preferred(snap)?;
         return Ok((
             entry.backend_addr,
             format!("host:transport:{}", entry.upstream_serial),
@@ -147,16 +148,64 @@ fn lookup_online<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'
     Ok(entry)
 }
 
-fn pick_any(snap: &DeviceSnapshot) -> Result<&DeviceEntry, String> {
+/// Pick a device when the client did not pass `-s`.
+///
+/// 1. Prefer online devices on the `local` backend.
+/// 2. Otherwise use the first backend (registry order) that has online devices.
+/// 3. Within the chosen backend, exactly one online device is required.
+fn pick_preferred(snap: &DeviceSnapshot) -> Result<&DeviceEntry, String> {
+    const LOCAL: &str = "local";
+
+    match pick_one_on_backend(snap, LOCAL) {
+        Ok(entry) => return Ok(entry),
+        Err(PickBackendErr::None) => {}
+        Err(PickBackendErr::Many) => {
+            return Err("more than one device/emulator".into());
+        }
+    }
+
+    // Preserve first-seen backend order from the merged device list.
+    let mut backend_order: Vec<&str> = Vec::new();
+    for d in &snap.devices {
+        if d.backend_name == LOCAL {
+            continue;
+        }
+        if !backend_order.contains(&d.backend_name.as_str()) {
+            backend_order.push(d.backend_name.as_str());
+        }
+    }
+
+    for name in backend_order {
+        match pick_one_on_backend(snap, name) {
+            Ok(entry) => return Ok(entry),
+            Err(PickBackendErr::None) => continue,
+            Err(PickBackendErr::Many) => {
+                return Err("more than one device/emulator".into());
+            }
+        }
+    }
+
+    Err("no devices/emulators found".into())
+}
+
+enum PickBackendErr {
+    None,
+    Many,
+}
+
+fn pick_one_on_backend<'a>(
+    snap: &'a DeviceSnapshot,
+    backend_name: &str,
+) -> Result<&'a DeviceEntry, PickBackendErr> {
     let online: Vec<_> = snap
         .devices
         .iter()
-        .filter(|d| d.state == "device")
+        .filter(|d| d.backend_name == backend_name && d.state == "device")
         .collect();
     match online.len() {
-        0 => Err("no devices/emulators found".into()),
+        0 => Err(PickBackendErr::None),
         1 => Ok(online[0]),
-        _ => Err("more than one device/emulator".into()),
+        _ => Err(PickBackendErr::Many),
     }
 }
 
@@ -266,6 +315,89 @@ mod route_tests {
         let (addr, svc) = route_service("host:tport:any", &snap_one(), default).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host:tport:serial:ABC");
+    }
+
+    #[test]
+    fn tport_any_prefers_local_even_if_remotes_exist() {
+        let snap = DeviceSnapshot {
+            devices: vec![
+                DeviceEntry {
+                    public_serial: "LOCAL1".into(),
+                    upstream_serial: "LOCAL1".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "local".into(),
+                    backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                },
+                DeviceEntry {
+                    public_serial: "REMOTE1".into(),
+                    upstream_serial: "REMOTE1".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "office".into(),
+                    backend_addr: "10.0.0.1:5038".parse().unwrap(),
+                },
+            ],
+        };
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) = route_service("host:tport:any", &snap, default).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:5039");
+        assert_eq!(svc, "host:tport:serial:LOCAL1");
+    }
+
+    #[test]
+    fn tport_any_falls_back_to_first_remote_with_device() {
+        let snap = DeviceSnapshot {
+            devices: vec![
+                DeviceEntry {
+                    public_serial: "REMOTE1".into(),
+                    upstream_serial: "REMOTE1".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "office".into(),
+                    backend_addr: "10.0.0.1:5038".parse().unwrap(),
+                },
+                DeviceEntry {
+                    public_serial: "REMOTE2".into(),
+                    upstream_serial: "REMOTE2".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "lab".into(),
+                    backend_addr: "10.0.0.2:5038".parse().unwrap(),
+                },
+            ],
+        };
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, svc) = route_service("host:transport-any", &snap, default).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(svc, "host:transport:REMOTE1");
+    }
+
+    #[test]
+    fn tport_any_errors_when_local_has_many() {
+        let snap = DeviceSnapshot {
+            devices: vec![
+                DeviceEntry {
+                    public_serial: "L1".into(),
+                    upstream_serial: "L1".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "local".into(),
+                    backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                },
+                DeviceEntry {
+                    public_serial: "L2".into(),
+                    upstream_serial: "L2".into(),
+                    state: "device".into(),
+                    extras: String::new(),
+                    backend_name: "local".into(),
+                    backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                },
+            ],
+        };
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let err = route_service("host:tport:any", &snap, default).unwrap_err();
+        assert!(err.contains("more than one"));
     }
 
     #[test]
