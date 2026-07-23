@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "adb-hub")]
-#[command(about = "Local adb server that aggregates remote adb-proxy backends")]
+#[command(about = "Local adb server that aggregates local USB + remote adb-proxy backends")]
 struct Args {
     /// Listen address (default 127.0.0.1:5037)
     #[arg(long, env = "ADB_HUB_LISTEN")]
@@ -28,6 +28,14 @@ struct Args {
     /// Device list poll interval in milliseconds
     #[arg(long, env = "ADB_HUB_POLL_MS")]
     poll_interval_ms: Option<u64>,
+
+    /// Do not start/aggregate the local USB adb server (default: aggregate local)
+    #[arg(long = "no-local", env = "ADB_HUB_NO_LOCAL")]
+    no_local: bool,
+
+    /// Side port for the real local adb server (default 5039)
+    #[arg(long, env = "ADB_HUB_LOCAL_PORT")]
+    local_port: Option<u16>,
 
     #[arg(long, default_value = "info", env = "ADB_HUB_LOG")]
     log_level: String,
@@ -67,11 +75,38 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
             poll_interval: std::time::Duration::from_millis(1000),
             backends,
             adb_version: 40,
+            include_local: !args.no_local,
+            local_adb_port: args.local_port.unwrap_or(5039),
         }
     } else if let Some(path) = args.config.as_ref() {
-        HubConfig::load_file(path)?
+        let mut c = HubConfig::load_file(path)?;
+        if args.no_local {
+            c.include_local = false;
+        }
+        if let Some(p) = args.local_port {
+            c.local_adb_port = p;
+        }
+        c
     } else {
-        load_default_config()?
+        match load_default_config() {
+            Ok(mut c) => {
+                if args.no_local {
+                    c.include_local = false;
+                }
+                if let Some(p) = args.local_port {
+                    c.local_adb_port = p;
+                }
+                c
+            }
+            Err(_) if !args.no_local => {
+                let mut c = HubConfig::local_only();
+                if let Some(p) = args.local_port {
+                    c.local_adb_port = p;
+                }
+                c
+            }
+            Err(err) => return Err(err),
+        }
     };
 
     if let Some(listen) = args.listen {
@@ -79,17 +114,6 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
     }
     if let Some(ms) = args.poll_interval_ms {
         config.poll_interval = std::time::Duration::from_millis(ms.max(100));
-    }
-
-    // If --backend was not used but --listen was with a loaded file, keep file backends.
-    // If --backend was used, already set. Allow combining: when both config file and
-    // --backend are given, --backend wins (handled above).
-    if args.backends.is_empty() && args.config.is_none() {
-        // already loaded default
-    }
-
-    if config.backends.is_empty() {
-        return Err("no backends configured; use --backend or a config file".into());
     }
 
     // Deduplicate by keeping last definition of a name.
@@ -102,6 +126,10 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
     }
     unique.reverse();
     config.backends = unique;
+
+    if config.backends.is_empty() && !config.include_local {
+        return Err("no backends configured; use --backend, a config file, or enable --local".into());
+    }
 
     Ok(config)
 }
@@ -121,7 +149,7 @@ fn load_default_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
         return Ok(HubConfig::load_legacy_file(&legacy)?);
     }
     Err(format!(
-        "no config found at {} or {}; pass --backend name=host:port",
+        "no config found at {} or {}; pass --backend name=host:port or rely on --local",
         path.display(),
         legacy.display()
     )

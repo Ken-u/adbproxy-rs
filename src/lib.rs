@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod config;
 pub mod hub;
+pub mod local;
 pub mod protocol;
 pub mod registry;
 pub mod session;

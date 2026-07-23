@@ -20,6 +20,10 @@ pub struct HubConfig {
     pub backends: Vec<BackendConfig>,
     /// ADB server version reported by `host:version` (decimal, encoded as %04x).
     pub adb_version: u32,
+    /// Start/reuse a real local adb server and aggregate it as backend `local`.
+    pub include_local: bool,
+    /// Side port for the real local adb server (hub keeps :5037).
+    pub local_adb_port: u16,
 }
 
 #[derive(Debug, Error)]
@@ -42,6 +46,10 @@ struct TomlFile {
     poll_interval_ms: u64,
     #[serde(default = "default_adb_version")]
     adb_version: u32,
+    #[serde(default = "default_include_local")]
+    include_local: bool,
+    #[serde(default = "default_local_adb_port")]
+    local_adb_port: u16,
     #[serde(default)]
     backend: Vec<TomlBackend>,
 }
@@ -64,6 +72,14 @@ fn default_adb_version() -> u32 {
     40
 }
 
+fn default_include_local() -> bool {
+    true
+}
+
+fn default_local_adb_port() -> u16 {
+    5039
+}
+
 impl HubConfig {
     pub fn default_listen() -> SocketAddr {
         "127.0.0.1:5037".parse().expect("valid default listen")
@@ -76,6 +92,15 @@ impl HubConfig {
             .parse()
             .map_err(|e| ConfigError::Invalid(format!("listen: {e}")))?;
 
+        if parsed.local_adb_port == 0 {
+            return Err(ConfigError::Invalid("local_adb_port must be non-zero".into()));
+        }
+        if listen.port() == parsed.local_adb_port {
+            return Err(ConfigError::Invalid(
+                "local_adb_port must differ from listen port".into(),
+            ));
+        }
+
         let mut backends = Vec::new();
         for (idx, b) in parsed.backend.into_iter().enumerate() {
             let addr: SocketAddr = b
@@ -86,9 +111,9 @@ impl HubConfig {
             backends.push(BackendConfig { name, addr });
         }
 
-        if backends.is_empty() {
+        if backends.is_empty() && !parsed.include_local {
             return Err(ConfigError::Invalid(
-                "at least one [[backend]] is required".into(),
+                "at least one [[backend]] is required when include_local = false".into(),
             ));
         }
 
@@ -97,6 +122,8 @@ impl HubConfig {
             poll_interval: Duration::from_millis(parsed.poll_interval_ms.max(100)),
             backends,
             adb_version: parsed.adb_version,
+            include_local: parsed.include_local,
+            local_adb_port: parsed.local_adb_port,
         })
     }
 
@@ -139,12 +166,26 @@ impl HubConfig {
                 addr,
             }],
             adb_version: default_adb_version(),
+            include_local: true,
+            local_adb_port: default_local_adb_port(),
         })
     }
 
     pub fn load_legacy_file(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)?;
         Self::from_legacy_adbproxy(&text)
+    }
+
+    /// Local-only defaults when no config / backends are provided.
+    pub fn local_only() -> Self {
+        Self {
+            listen: Self::default_listen(),
+            poll_interval: Duration::from_millis(default_poll_ms()),
+            backends: Vec::new(),
+            adb_version: default_adb_version(),
+            include_local: true,
+            local_adb_port: default_local_adb_port(),
+        }
     }
 }
 
@@ -215,6 +256,27 @@ addr = "10.0.0.2:5038"
         assert_eq!(cfg.backends.len(), 2);
         assert_eq!(cfg.backends[0].name, "office");
         assert_eq!(cfg.backends[1].name, "10.0.0.2_5038");
+        assert!(cfg.include_local);
+        assert_eq!(cfg.local_adb_port, 5039);
+    }
+
+    #[test]
+    fn parse_toml_local_only() {
+        let cfg = HubConfig::from_toml_str(
+            r#"
+include_local = true
+local_adb_port = 5040
+"#,
+        )
+        .unwrap();
+        assert!(cfg.backends.is_empty());
+        assert_eq!(cfg.local_adb_port, 5040);
+    }
+
+    #[test]
+    fn reject_empty_without_local() {
+        let err = HubConfig::from_toml_str("include_local = false\n").unwrap_err();
+        assert!(err.to_string().contains("at least one"));
     }
 
     #[test]
@@ -222,6 +284,7 @@ addr = "10.0.0.2:5038"
         let cfg = HubConfig::from_legacy_adbproxy("host=192.168.1.5\nport=5038\n").unwrap();
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].addr.to_string(), "192.168.1.5:5038");
+        assert!(cfg.include_local);
     }
 
     #[test]

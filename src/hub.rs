@@ -8,7 +8,8 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::backend::run_backend_poller;
-use crate::config::HubConfig;
+use crate::config::{BackendConfig, HubConfig};
+use crate::local::LocalAdb;
 use crate::registry::DeviceRegistry;
 use crate::session::{handle_client, SessionContext};
 
@@ -25,6 +26,9 @@ pub enum HubError {
         #[source]
         source: io::Error,
     },
+
+    #[error("local adb server error: {0}")]
+    LocalAdb(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, HubError>;
@@ -34,9 +38,35 @@ pub async fn run_hub(config: HubConfig) -> Result<()> {
 }
 
 pub async fn run_hub_with_shutdown(
-    config: HubConfig,
+    mut config: HubConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    // Keep LocalAdb alive for the hub lifetime so Drop can kill the side server.
+    let _local_adb = if config.include_local {
+        let local = LocalAdb::prepare(config.local_adb_port)
+            .await
+            .map_err(HubError::LocalAdb)?;
+        // Prepend local backend; skip if user already configured the same name/addr.
+        let local_backend = BackendConfig {
+            name: LocalAdb::backend_name().to_string(),
+            addr: local.addr,
+        };
+        config
+            .backends
+            .retain(|b| b.name != local_backend.name && b.addr != local_backend.addr);
+        config.backends.insert(0, local_backend);
+        Some(local)
+    } else {
+        None
+    };
+
+    if config.backends.is_empty() {
+        return Err(HubError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no backends configured",
+        )));
+    }
+
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|source| HubError::Bind {
@@ -47,6 +77,7 @@ pub async fn run_hub_with_shutdown(
     info!(
         listen = %config.listen,
         backends = config.backends.len(),
+        include_local = config.include_local,
         "adb-hub listening"
     );
     for b in &config.backends {
@@ -62,7 +93,6 @@ pub async fn run_hub_with_shutdown(
         run_backend_poller(poller_config, poller_registry).await;
     });
 
-    // Give the first poll a brief head start before accepting (non-blocking best-effort).
     tokio::task::yield_now().await;
 
     tokio::pin!(shutdown);

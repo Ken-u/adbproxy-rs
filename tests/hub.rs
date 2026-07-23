@@ -68,6 +68,8 @@ async fn hub_lists_and_transports() {
             addr: backend_addr,
         }],
         adb_version: 40,
+        include_local: false,
+        local_adb_port: 5039,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -147,6 +149,8 @@ async fn hub_rewrites_conflicting_serials() {
             },
         ],
         adb_version: 40,
+        include_local: false,
+        local_adb_port: 5039,
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

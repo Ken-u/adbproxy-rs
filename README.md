@@ -50,6 +50,8 @@ Example config:
 ```toml
 listen = "127.0.0.1:5037"
 poll_interval_ms = 1000
+include_local = true
+local_adb_port = 5039
 
 [[backend]]
 name = "office"
@@ -59,6 +61,8 @@ addr = "192.168.1.10:5038"
 name = "lab"
 addr = "192.168.1.11:5038"
 ```
+
+By default `adb-hub` also starts a real local `adb` server on `local_adb_port` (5039), frees `:5037` for itself, and aggregates local USB devices as backend `local` together with remotes. Use `--no-local` to disable.
 
 Then use the original `adb` as usual (no `-H` / `-P`, no PATH wrapper):
 
@@ -74,17 +78,21 @@ Legacy `~/.adbproxy` (`host=` / `port=`) is still loaded when the TOML config is
 
 ## Setup helper
 
-[`adb_setup.sh`](adb_setup.sh) writes a client TOML config and prints how to run `adb-hub`. It no longer replaces the `adb` binary.
+[`adb_setup.sh`](adb_setup.sh) downloads the latest GitHub Release for your OS/arch, installs `adb-hub` and `adb-proxy` into `~/.local/bin`, then writes the client TOML config. It does not replace the official `adb` binary.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.sh | bash
 ```
 
-If an old bash wrapper is still installed:
+Useful flags:
 
 ```bash
-bash adb_setup.sh --uninstall-wrapper
+bash adb_setup.sh --install              # download + install only
+bash adb_setup.sh --config               # config only
+bash adb_setup.sh --uninstall-wrapper    # remove legacy PATH wrapper
 ```
+
+Install directory override: `ADB_PROXY_INSTALL_DIR=~/bin`.
 
 ## Binary usage
 
@@ -145,6 +153,7 @@ Implemented:
 
 - Transparent TCP `adb-proxy` (device host)
 - Protocol-aware `adb-hub` on `:5037` (client)
+- Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
 - `host:version`, `host:devices` / `devices-l`, `host:track-devices`, `host:transport:*`, `host:transport-any`, `host:kill`, `host-serial:*` forwarding
 - TOML config + legacy `~/.adbproxy` + CLI `--backend`
@@ -153,4 +162,4 @@ Not in this phase:
 
 - LAN auto-discovery / `adb pair`
 - Auth / ACL
-- Sharing `:5037` with a real local USB adb server (stop hub to use local USB)
+- Sharing `:5037` with a separately started default adb server (hub relocates local adb to `local_adb_port`)
