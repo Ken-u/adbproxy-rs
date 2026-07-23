@@ -77,7 +77,8 @@ pub async fn run_proxy_with_shutdown(
                 let (client, client_addr) = accepted?;
                 let target = config.target;
                 let pair_code = config.pair_code.clone();
-                info!(client = %client_addr, target = %target, "client connected");
+                // Normal adb clients open many short-lived TCP sessions; keep at debug.
+                debug!(client = %client_addr, target = %target, "client connected");
 
                 tokio::spawn(async move {
                     match proxy_connection(client, client_addr, target, &pair_code).await {
@@ -85,7 +86,7 @@ pub async fn run_proxy_with_shutdown(
                             info!(client = %client_addr, "client rejected (auth)");
                         }
                         Ok(Some(stats)) => {
-                            info!(
+                            debug!(
                                 client = %stats.client_addr,
                                 target = %stats.target_addr,
                                 bytes_client_to_server = stats.bytes_client_to_server,
@@ -95,7 +96,7 @@ pub async fn run_proxy_with_shutdown(
                             );
                         }
                         Err(err) if is_expected_disconnect(&err) => {
-                            warn!(client = %client_addr, target = %target, error = %err, "client disconnected with socket error");
+                            debug!(client = %client_addr, target = %target, error = %err, "client disconnected with socket error");
                         }
                         Err(err) => {
                             error!(client = %client_addr, target = %target, error = %err, "connection failed");

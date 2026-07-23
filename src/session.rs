@@ -18,6 +18,8 @@ pub struct SessionContext {
     /// Backend used for host services without a device serial (features, version, …).
     pub default_backend: SocketAddr,
     pub default_pair_code: Option<String>,
+    /// Configured backend names in order (local first when enabled).
+    pub backend_order: Vec<String>,
     pub kill_notify: Arc<Notify>,
 }
 
@@ -65,12 +67,19 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
     }
 
     let snap = ctx.registry.snapshot().await;
-    match route_service(&service, &snap, ctx.default_backend, ctx.default_pair_code.as_deref()) {
+    match route_service(
+        &service,
+        &snap,
+        ctx.default_backend,
+        ctx.default_pair_code.as_deref(),
+        &ctx.backend_order,
+    ) {
         Ok((addr, pair_code, upstream_service)) => {
             debug!(%addr, service = %upstream_service, "forwarding to backend");
             forward_session(&mut client, addr, pair_code.as_deref(), &upstream_service).await
         }
         Err(reason) => {
+            warn!(service = %service, %reason, "route failed");
             write_fail(&mut client, &reason).await?;
             Ok(())
         }
@@ -83,6 +92,7 @@ fn route_service(
     snap: &DeviceSnapshot,
     default_backend: SocketAddr,
     default_pair_code: Option<&str>,
+    backend_order: &[String],
 ) -> Result<(SocketAddr, Option<String>, String), String> {
     // Exact transport selectors MUST be checked before `host:transport:` /
     // `host:tport:serial:` prefixes — otherwise `transport-any` becomes serial "any".
@@ -93,7 +103,7 @@ fn route_service(
         || service == "host:transport-usb"
         || service == "host:transport-local"
     {
-        let entry = pick_preferred(snap)?;
+        let entry = pick_preferred(snap, backend_order)?;
         let upstream = if service.starts_with("host:tport:") {
             format!("host:tport:serial:{}", entry.upstream_serial)
         } else {
@@ -137,7 +147,7 @@ fn route_service(
 
     // host-usb:<request> / host-local:<request> — device-scoped without -s
     if let Some(request) = service.strip_prefix("host-usb:") {
-        let entry = pick_preferred(snap)?;
+        let entry = pick_preferred(snap, backend_order)?;
         return Ok((
             entry.backend_addr,
             entry.pair_code.clone(),
@@ -145,12 +155,24 @@ fn route_service(
         ));
     }
     if let Some(request) = service.strip_prefix("host-local:") {
-        let entry = pick_preferred(snap)?;
+        let entry = pick_preferred(snap, backend_order)?;
         return Ok((
             entry.backend_addr,
             entry.pair_code.clone(),
             format!("host-serial:{}:{}", entry.upstream_serial, request),
         ));
+    }
+
+    // host:features — send to the same backend we'd pick for shell without -s,
+    // so feature bits match the device that will actually be used.
+    if service == "host:features" || service == "host:host-features" {
+        if let Ok(entry) = pick_preferred(snap, backend_order) {
+            return Ok((
+                entry.backend_addr,
+                entry.pair_code.clone(),
+                service.to_string(),
+            ));
+        }
     }
 
     // Default: opaque forward to the default backend (local adb or first remote).
@@ -177,36 +199,43 @@ fn lookup_online<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'
 /// Pick a device when the client did not pass `-s`.
 ///
 /// 1. Prefer online devices on the `local` backend.
-/// 2. Otherwise use the first backend (registry order) that has online devices.
+/// 2. Otherwise walk configured backends in order; use the first with online devices.
 /// 3. Within the chosen backend, exactly one online device is required.
-fn pick_preferred(snap: &DeviceSnapshot) -> Result<&DeviceEntry, String> {
+fn pick_preferred<'a>(
+    snap: &'a DeviceSnapshot,
+    backend_order: &[String],
+) -> Result<&'a DeviceEntry, String> {
     const LOCAL: &str = "local";
 
-    match pick_one_on_backend(snap, LOCAL) {
-        Ok(entry) => return Ok(entry),
-        Err(PickBackendErr::None) => {}
-        Err(PickBackendErr::Many) => {
-            return Err("more than one device/emulator".into());
-        }
+    // Always try local first when it exists in the order list (or in the snap).
+    let mut order: Vec<&str> = Vec::new();
+    if backend_order.iter().any(|n| n == LOCAL) || snap.devices.iter().any(|d| d.backend_name == LOCAL)
+    {
+        order.push(LOCAL);
     }
-
-    // Preserve first-seen backend order from the merged device list.
-    let mut backend_order: Vec<&str> = Vec::new();
-    for d in &snap.devices {
-        if d.backend_name == LOCAL {
+    for name in backend_order {
+        if name == LOCAL {
             continue;
         }
-        if !backend_order.contains(&d.backend_name.as_str()) {
-            backend_order.push(d.backend_name.as_str());
+        if !order.contains(&name.as_str()) {
+            order.push(name.as_str());
+        }
+    }
+    // Fall back to snap order for any backend not listed (shouldn't happen).
+    for d in &snap.devices {
+        if !order.contains(&d.backend_name.as_str()) {
+            order.push(d.backend_name.as_str());
         }
     }
 
-    for name in backend_order {
+    for name in order {
         match pick_one_on_backend(snap, name) {
             Ok(entry) => return Ok(entry),
             Err(PickBackendErr::None) => continue,
             Err(PickBackendErr::Many) => {
-                return Err("more than one device/emulator".into());
+                return Err(format!(
+                    "more than one device/emulator on backend '{name}'"
+                ));
             }
         }
     }
@@ -325,11 +354,21 @@ mod route_tests {
         }
     }
 
+    fn order(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn rewrites_transport_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, code, svc) =
-            route_service("host:transport:office:ABC", &snap_one(), default, None).unwrap();
+        let (addr, code, svc) = route_service(
+            "host:transport:office:ABC",
+            &snap_one(),
+            default,
+            None,
+            &order(&["office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host:transport:ABC");
@@ -338,8 +377,14 @@ mod route_tests {
     #[test]
     fn rewrites_tport_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, _, svc) =
-            route_service("host:tport:serial:office:ABC", &snap_one(), default, None).unwrap();
+        let (addr, _, svc) = route_service(
+            "host:tport:serial:office:ABC",
+            &snap_one(),
+            default,
+            None,
+            &order(&["office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host:tport:serial:ABC");
     }
@@ -347,7 +392,14 @@ mod route_tests {
     #[test]
     fn tport_any_becomes_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, _, svc) = route_service("host:tport:any", &snap_one(), default, None).unwrap();
+        let (addr, _, svc) = route_service(
+            "host:tport:any",
+            &snap_one(),
+            default,
+            None,
+            &order(&["local", "office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host:tport:serial:ABC");
     }
@@ -377,7 +429,14 @@ mod route_tests {
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, code, svc) = route_service("host:tport:any", &snap, default, None).unwrap();
+        let (addr, code, svc) = route_service(
+            "host:tport:any",
+            &snap,
+            default,
+            None,
+            &order(&["local", "office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "127.0.0.1:5039");
         assert!(code.is_none());
         assert_eq!(svc, "host:tport:serial:LOCAL1");
@@ -408,7 +467,14 @@ mod route_tests {
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, code, svc) = route_service("host:transport-any", &snap, default, None).unwrap();
+        let (addr, code, svc) = route_service(
+            "host:transport-any",
+            &snap,
+            default,
+            None,
+            &order(&["local", "office", "lab"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(code.as_deref(), Some("CODE1111"));
         assert_eq!(svc, "host:transport:REMOTE1");
@@ -439,16 +505,28 @@ mod route_tests {
             ],
         };
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let err = route_service("host:tport:any", &snap, default, None).unwrap_err();
+        let err = route_service(
+            "host:tport:any",
+            &snap,
+            default,
+            None,
+            &order(&["local"]),
+        )
+        .unwrap_err();
         assert!(err.contains("more than one"));
     }
 
     #[test]
     fn transport_any_not_parsed_as_serial_any() {
-        // Regression: strip_prefix("host:transport:") used to turn this into serial "any".
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, code, svc) =
-            route_service("host:transport-any", &snap_one(), default, None).unwrap();
+        let (addr, code, svc) = route_service(
+            "host:transport-any",
+            &snap_one(),
+            default,
+            None,
+            &order(&["office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host:transport:ABC");
@@ -457,9 +535,11 @@ mod route_tests {
     #[test]
     fn transport_usb_and_local_use_preferred() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (_, _, usb) = route_service("host:transport-usb", &snap_one(), default, None).unwrap();
+        let o = order(&["office"]);
+        let (_, _, usb) =
+            route_service("host:transport-usb", &snap_one(), default, None, &o).unwrap();
         let (_, _, local) =
-            route_service("host:transport-local", &snap_one(), default, None).unwrap();
+            route_service("host:transport-local", &snap_one(), default, None, &o).unwrap();
         assert_eq!(usb, "host:transport:ABC");
         assert_eq!(local, "host:transport:ABC");
     }
@@ -467,8 +547,14 @@ mod route_tests {
     #[test]
     fn host_usb_request_rewrites_to_host_serial() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, _, svc) =
-            route_service("host-usb:get-state", &snap_one(), default, None).unwrap();
+        let (addr, _, svc) = route_service(
+            "host-usb:get-state",
+            &snap_one(),
+            default,
+            None,
+            &order(&["office"]),
+        )
+        .unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(svc, "host-serial:ABC:get-state");
     }
@@ -476,17 +562,31 @@ mod route_tests {
     #[test]
     fn tport_usb_uses_preferred() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (_, _, svc) = route_service("host:tport:usb", &snap_one(), default, None).unwrap();
+        let (_, _, svc) = route_service(
+            "host:tport:usb",
+            &snap_one(),
+            default,
+            None,
+            &order(&["office"]),
+        )
+        .unwrap();
         assert_eq!(svc, "host:tport:serial:ABC");
     }
 
     #[test]
-    fn features_goes_to_default() {
+    fn features_follows_preferred_device_backend() {
         let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
-        let (addr, code, svc) =
-            route_service("host:features", &snap_one(), default, Some("LOCALCODE")).unwrap();
-        assert_eq!(addr, default);
-        assert_eq!(code.as_deref(), Some("LOCALCODE"));
+        let (addr, code, svc) = route_service(
+            "host:features",
+            &snap_one(),
+            default,
+            Some("LOCALCODE"),
+            &order(&["local", "office"]),
+        )
+        .unwrap();
+        // Prefer office (has the only online device) over empty local default.
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host:features");
     }
 }

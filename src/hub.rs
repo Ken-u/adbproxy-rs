@@ -5,7 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backend::{fetch_server_version, run_backend_poller};
 use crate::config::{BackendConfig, HubConfig};
@@ -77,6 +77,16 @@ pub async fn run_hub_with_shutdown(
         )));
     }
 
+    let default_backend = config.backends[0].addr;
+    let default_pair_code = config.backends[0].pair_code.clone();
+    let backend_order: Vec<String> = config.backends.iter().map(|b| b.name.clone()).collect();
+    let registry = DeviceRegistry::new();
+    let kill_notify = Arc::new(Notify::new());
+
+    // Populate registry BEFORE binding so wait_for_port / early clients never see
+    // an empty snapshot and return "no devices".
+    crate::backend::poll_backends_once(&config, &registry).await;
+
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|source| HubError::Bind {
@@ -94,18 +104,11 @@ pub async fn run_hub_with_shutdown(
         info!(name = %b.name, addr = %b.addr, "backend configured");
     }
 
-    let default_backend = config.backends[0].addr;
-    let default_pair_code = config.backends[0].pair_code.clone();
-    let registry = DeviceRegistry::new();
-    let kill_notify = Arc::new(Notify::new());
-
     let poller_config = config.clone();
     let poller_registry = registry.clone();
     let poller = tokio::spawn(async move {
         run_backend_poller(poller_config, poller_registry).await;
     });
-
-    tokio::task::yield_now().await;
 
     tokio::pin!(shutdown);
 
@@ -123,17 +126,18 @@ pub async fn run_hub_with_shutdown(
             }
             accepted = listener.accept() => {
                 let (client, client_addr) = accepted?;
-                info!(client = %client_addr, "client connected");
+                debug!(client = %client_addr, "client connected");
                 let ctx = SessionContext {
                     registry: registry.clone(),
                     default_backend,
                     default_pair_code: default_pair_code.clone(),
+                    backend_order: backend_order.clone(),
                     kill_notify: kill_notify.clone(),
                 };
                 tokio::spawn(async move {
                     if let Err(err) = handle_client(client, ctx).await {
                         if is_benign(&err) {
-                            warn!(client = %client_addr, error = %err, "client disconnected");
+                            debug!(client = %client_addr, error = %err, "client disconnected");
                         } else {
                             error!(client = %client_addr, error = %err, "client session failed");
                         }
