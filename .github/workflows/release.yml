@@ -1,12 +1,17 @@
 name: Release
 
+# Build on every main push. Create tag + GitHub Release only when Cargo.toml
+# version does not already have a release. Do NOT trigger on tag pushes
+# (avoids duplicate workflows when the release job creates the tag).
 on:
   workflow_dispatch:
   push:
     branches:
       - main
-    tags:
-      - "v*"
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -16,6 +21,7 @@ jobs:
     name: Resolve version
     runs-on: ubuntu-latest
     outputs:
+      version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       release_exists: ${{ steps.release.outputs.exists }}
 
@@ -39,14 +45,14 @@ jobs:
               exit
             }
           ' Cargo.toml)"
-          cargo_tag="v$version"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="$cargo_tag"
+          if [[ -z "$version" ]]; then
+            echo "Could not read package.version from Cargo.toml" >&2
+            exit 1
           fi
+          tag="v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Cargo version $version → tag $tag"
 
       - name: Check existing release
         id: release
@@ -58,8 +64,10 @@ jobs:
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; build only"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG missing; will publish after build"
           fi
 
   build:
@@ -159,8 +167,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && needs.version.outputs.release_exists == 'false')
+    name: Tag and publish release
+    if: needs.version.outputs.release_exists == 'false'
     needs:
       - version
       - build
@@ -169,6 +177,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -176,8 +187,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create tag for Cargo version
-        if: github.ref == 'refs/heads/main'
+      - name: Create tag from Cargo version
         env:
           TAG: ${{ needs.version.outputs.tag }}
         shell: bash
@@ -185,14 +195,22 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            git tag "$TAG"
+          if git rev-parse "$TAG" >/dev/null 2>&1 || \
+             git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+          else
+            git tag "$TAG" "${{ github.sha }}"
             git push origin "$TAG"
+            echo "Created and pushed tag $TAG"
           fi
 
-      - name: Publish release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
           files: dist/*.tar.gz
           generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
