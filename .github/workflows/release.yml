@@ -73,31 +73,31 @@ jobs:
           - name: linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            build: cargo build --release --target x86_64-unknown-linux-musl
-            bin: target/x86_64-unknown-linux-musl/release/adb-proxy
-            executable: adb-proxy
+            build: cargo build --release --bins --target x86_64-unknown-linux-musl
+            bin_dir: target/x86_64-unknown-linux-musl/release
             archive: adb-proxy-linux-x86_64-musl.tar.gz
+            exe_suffix: ""
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-            build: cargo build --release --target aarch64-apple-darwin
-            bin: target/aarch64-apple-darwin/release/adb-proxy
-            executable: adb-proxy
+            build: cargo build --release --bins --target aarch64-apple-darwin
+            bin_dir: target/aarch64-apple-darwin/release
             archive: adb-proxy-macos-aarch64.tar.gz
+            exe_suffix: ""
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
-            build: cargo build --release --target x86_64-apple-darwin
-            bin: target/x86_64-apple-darwin/release/adb-proxy
-            executable: adb-proxy
+            build: cargo build --release --bins --target x86_64-apple-darwin
+            bin_dir: target/x86_64-apple-darwin/release
             archive: adb-proxy-macos-x86_64.tar.gz
+            exe_suffix: ""
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            build: cargo build --release --target x86_64-pc-windows-msvc
-            bin: target/x86_64-pc-windows-msvc/release/adb-proxy.exe
-            executable: adb-proxy.exe
+            build: cargo build --release --bins --target x86_64-pc-windows-msvc
+            bin_dir: target/x86_64-pc-windows-msvc/release
             archive: adb-proxy-windows-x86_64.tar.gz
+            exe_suffix: ".exe"
 
     steps:
       - name: Checkout
@@ -120,8 +120,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          file "${{ matrix.bin }}"
-          ldd "${{ matrix.bin }}" 2>&1 | grep -E 'not a dynamic executable|statically linked'
+          for bin in adb-proxy adb-hub; do
+            file "${{ matrix.bin_dir }}/$bin"
+            ldd "${{ matrix.bin_dir }}/$bin" 2>&1 | grep -E 'not a dynamic executable|statically linked'
+          done
 
       - name: Package
         shell: bash
@@ -129,21 +131,23 @@ jobs:
           set -euo pipefail
           staging="dist/${{ matrix.name }}"
           mkdir -p "$staging"
-          cp "${{ matrix.bin }}" "$staging/${{ matrix.executable }}"
-          chmod +x "$staging/${{ matrix.executable }}"
+          suffix="${{ matrix.exe_suffix }}"
+          cp "${{ matrix.bin_dir }}/adb-proxy${suffix}" "$staging/adb-proxy${suffix}"
+          cp "${{ matrix.bin_dir }}/adb-hub${suffix}" "$staging/adb-hub${suffix}"
+          chmod +x "$staging/adb-proxy${suffix}" "$staging/adb-hub${suffix}"
           printf '%s\n' \
-            'adb-proxy' \
+            'adb-proxy + adb-hub' \
             '' \
-            'Run on the machine connected to the USB Android device:' \
+            'On the USB device host:' \
             '' \
             '    adb start-server' \
             '    ./adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
-            '    adb-proxy.exe --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
             '' \
-            'Run from a remote client:' \
+            'On the client laptop:' \
             '' \
-            '    adb -H <server_ip> -P 5038 devices' \
-            '    adb -H <server_ip> -P 5038 shell' \
+            '    adb kill-server' \
+            '    ./adb-hub --backend office=<server_ip>:5038' \
+            '    adb devices' \
             > "$staging/README.txt"
           tar -C "$staging" -czf "dist/${{ matrix.archive }}" .
 

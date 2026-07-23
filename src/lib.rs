@@ -1,3 +1,10 @@
+pub mod backend;
+pub mod config;
+pub mod hub;
+pub mod protocol;
+pub mod registry;
+pub mod session;
+
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
