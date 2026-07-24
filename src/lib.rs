@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::auth::accept_auth;
 

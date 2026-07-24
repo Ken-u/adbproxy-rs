@@ -5,6 +5,7 @@
 #   .\adb_setup.ps1                 # download + install, then interactive config
 #   .\adb_setup.ps1 -Install        # download + install only
 #   .\adb_setup.ps1 -Config         # interactive config only
+#   .\adb_setup.ps1 -UninstallWrapper  # remove legacy PATH wrapper
 #
 # Environment:
 #   $env:ADB_PROXY_INSTALL_DIR   Install directory (default: $HOME\.local\bin)
@@ -14,6 +15,7 @@
 param(
     [switch]$Install,
     [switch]$Config,
+    [switch]$UninstallWrapper,
     [switch]$Help
 )
 
@@ -26,6 +28,7 @@ $ConfigFile   = Join-Path $ConfigDir 'config.toml'
 $LegacyConfig = Join-Path $HOME '.adbproxy'
 $ApiBase      = "https://api.github.com/repos/$Repo"
 $ReleaseBase  = "https://github.com/$Repo/releases/download"
+$WrapperMarker = '# adb-wrapper'
 
 function Show-Help {
     Write-Host @"
@@ -38,6 +41,8 @@ Usage:
   .\adb_setup.ps1                 Download+install, then interactive config
   .\adb_setup.ps1 -Install        Download+install only
   .\adb_setup.ps1 -Config         Interactive config only
+  .\adb_setup.ps1 -UninstallWrapper
+                                  Remove legacy PATH wrapper
   .\adb_setup.ps1 -Help
 
 Environment:
@@ -202,12 +207,71 @@ Device host (USB machine):
 
 Re-run install only:   .\adb_setup.ps1 -Install
 Config only:           .\adb_setup.ps1 -Config
+Remove old wrapper:    .\adb_setup.ps1 -UninstallWrapper
 "@
+}
+
+function Test-IsWrapperAdb([string]$Path) {
+    if (-not (Test-Path $Path)) { return $false }
+    $lines = Get-Content $Path -TotalCount 5 -ErrorAction SilentlyContinue
+    if (-not $lines) { return $false }
+    foreach ($line in $lines) {
+        if ($line -and $line.Contains($WrapperMarker)) { return $true }
+    }
+    return $false
+}
+
+function Resolve-Executable([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    $fi = Get-Item $Path
+    while ($fi.LinkType -eq 'SymbolicLink') {
+        $target = if ($fi.Target) { $fi.Target[0] } else { $null }
+        if (-not $target) { break }
+        $fi = Get-Item $target
+    }
+    if (-not $fi -or -not $fi.PSIsContainer -and -not $fi.Length) { return $null }
+    return $fi.FullName
+}
+
+function Uninstall-OldWrapper {
+    $adbCmd = Get-Command adb -ErrorAction SilentlyContinue
+    if (-not $adbCmd) {
+        Write-Host "adb not found in PATH; nothing to uninstall."
+        return
+    }
+    $resolved = Resolve-Executable $adbCmd.Source
+    if (-not $resolved) {
+        throw "cannot resolve adb at $($adbCmd.Source)"
+    }
+    if (-not (Test-IsWrapperAdb $resolved)) {
+        Write-Host "Current adb is not an adb-wrapper; nothing to uninstall."
+        return
+    }
+
+    $adbDir   = Split-Path $resolved -Parent
+    $wrapped  = Join-Path $adbDir 'wrapper\adb.exe'
+    if (-not (Test-Path $wrapped)) {
+        throw "original adb not found at $wrapped"
+    }
+    if (Test-IsWrapperAdb $wrapped) {
+        throw "$wrapped is also a wrapper; refusing to uninstall."
+    }
+
+    Copy-Item $wrapped $resolved -Force
+    Remove-Item $wrapped -Force
+    $wrapperDir = Join-Path $adbDir 'wrapper'
+    if (Test-Path $wrapperDir) {
+        Remove-Item $wrapperDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "Restored original adb to $resolved"
 }
 
 if ($Help) { Show-Help; return }
 
-if ($Install) {
+if ($UninstallWrapper) {
+    Uninstall-OldWrapper
+}
+elseif ($Install) {
     Download-And-Install
 }
 elseif ($Config) {

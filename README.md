@@ -127,8 +127,9 @@ irm https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.ps1 | iex
 Useful flags:
 
 ```powershell
-.\adb_setup.ps1 -Install    # download + install only
-.\adb_setup.ps1 -Config     # interactive config only
+.\adb_setup.ps1 -Install             # download + install only
+.\adb_setup.ps1 -Config              # interactive config only
+.\adb_setup.ps1 -UninstallWrapper    # remove legacy PATH wrapper
 ```
 
 Install directory override: `$env:ADB_PROXY_INSTALL_DIR = "$HOME\bin"`.
