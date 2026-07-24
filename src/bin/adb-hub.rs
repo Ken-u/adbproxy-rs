@@ -4,8 +4,8 @@ use std::process;
 
 use adb_proxy::auth::{authenticate_stream, validate_pair_code};
 use adb_proxy::config::{
-    default_backend_name, default_config_path, legacy_config_path, parse_backend_arg,
-    BackendConfig, HubConfig,
+    default_backend_name, default_config_path, legacy_config_path, old_config_path,
+    parse_backend_arg, BackendConfig, HubConfig,
 };
 use adb_proxy::hub::run_hub_with_shutdown;
 use clap::{Parser, Subcommand};
@@ -23,7 +23,8 @@ struct Args {
     #[arg(long, env = "ADB_HUB_LISTEN", global = true)]
     listen: Option<SocketAddr>,
 
-    /// Path to TOML config (default ~/.config/adb-hub/config.toml)
+    /// Path to TOML config (default: %APPDATA%\adb-hub\config.toml on Windows,
+    /// ~/.config/adb-hub/config.toml on Linux/macOS)
     #[arg(long, env = "ADB_HUB_CONFIG", global = true)]
     config: Option<PathBuf>,
 
@@ -203,6 +204,17 @@ fn load_default_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
     if path.is_file() {
         return Ok(HubConfig::load_file(&path)?);
     }
+    // Fall back to the previous Windows location (~/.config/adb-hub/config.toml)
+    // so existing installs keep working after the APPDATA migration.
+    let old = old_config_path();
+    if old.is_file() && old != path {
+        eprintln!(
+            "adb-hub: loading config from legacy location {} (consider moving it to {})",
+            old.display(),
+            path.display()
+        );
+        return Ok(HubConfig::load_file(&old)?);
+    }
     let legacy = legacy_config_path();
     if legacy.is_file() {
         eprintln!(
@@ -213,8 +225,9 @@ fn load_default_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
         return Ok(HubConfig::load_legacy_file(&legacy)?);
     }
     Err(format!(
-        "no config found at {} or {}; pass --backend name=host:port or rely on --local",
+        "no config found at {}, {}, or {}; pass --backend name=host:port or rely on --local",
         path.display(),
+        old.display(),
         legacy.display()
     )
     .into())

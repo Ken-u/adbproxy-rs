@@ -267,6 +267,27 @@ pub fn default_backend_name(addr: SocketAddr) -> String {
 }
 
 pub fn default_config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Directory for the hub config file.
+///
+/// On Windows uses `%APPDATA%\adb-hub`; on Unix uses `~/.config/adb-hub`.
+/// Falls back to `~/.config/adb-hub` when APPDATA is unset on Windows.
+pub fn config_dir() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("adb-hub");
+        }
+    }
+    dirs_next_home()
+        .map(|h| h.join(".config/adb-hub"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Previous config location used on Windows before the APPDATA migration.
+/// Checked as a fallback so existing installs keep working.
+pub fn old_config_path() -> PathBuf {
     dirs_next_home()
         .map(|h| h.join(".config/adb-hub/config.toml"))
         .unwrap_or_else(|| PathBuf::from("config.toml"))

@@ -43,7 +43,9 @@ Stop any local adb server that already owns `:5037`, then pair and start the hub
 ```bash
 adb kill-server
 
-# Pair with a remote proxy (writes ~/.config/adb-hub/config.toml)
+# Pair with a remote proxy (writes config to the default location —
+#   ~/.config/adb-hub/config.toml on Linux/macOS,
+#   %APPDATA%\adb-hub\config.toml on Windows)
 adb-hub pair 192.168.1.10:5038 ABCD1234 --name office
 adb-hub pair 192.168.1.11:5038 EFGH5678 --name lab
 
@@ -134,7 +136,7 @@ Useful flags:
 
 Install directory override: `$env:ADB_PROXY_INSTALL_DIR = "$HOME\bin"`.
 
-> **Note** — Windows uses `tar` (bundled since Windows 10 1803) to extract the archive, and writes config to `%USERPROFILE%\.config\adb-hub\config.toml`. If the install directory is not on `PATH`, the script offers to append it to the user-level `PATH`.
+> **Note** — Windows config is written to `%APPDATA%\adb-hub\config.toml`. If a config from the previous location (`%USERPROFILE%\.config\adb-hub\config.toml`) is found, `adb-hub` loads it automatically. Windows uses `tar` (bundled since Windows 10 1803) to extract the archive, and if the install directory is not on `PATH` the script offers to append it to the user-level `PATH`.
 
 ## Binary usage
 

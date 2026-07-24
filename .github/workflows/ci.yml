@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  bash-setup-tests:
+    name: adb_setup_test.sh
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bash setup tests
+        run: bash tests/adb_setup_test.sh
+
+  windows:
+    name: Windows smoke + setup tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --bins
+
+      - name: Smoke test — binaries respond to --help
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/adb-proxy.exe --help    | grep -qi 'adb-proxy'
+          ./target/debug/adb-hub.exe --help      | grep -qi 'adb-hub'
+
+      - name: Run PowerShell setup tests
+        shell: pwsh
+        run: .\tests\adb_setup_test.ps1

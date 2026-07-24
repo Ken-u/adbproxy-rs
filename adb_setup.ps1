@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 
 $Repo         = if ($env:ADB_PROXY_REPO) { $env:ADB_PROXY_REPO } else { 'Ken-u/adbproxy-rs' }
 $InstallDir   = if ($env:ADB_PROXY_INSTALL_DIR) { $env:ADB_PROXY_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
-$ConfigDir    = Join-Path $HOME '.config\adb-hub'
+$ConfigDir    = Join-Path $env:APPDATA 'adb-hub'
 $ConfigFile   = Join-Path $ConfigDir 'config.toml'
 $LegacyConfig = Join-Path $HOME '.adbproxy'
 $ApiBase      = "https://api.github.com/repos/$Repo"
