@@ -266,23 +266,30 @@ function Uninstall-OldWrapper {
     Write-Host "Restored original adb to $resolved"
 }
 
-if ($Help) { Show-Help; return }
+function Invoke-Main {
+    if ($Help) { Show-Help; return }
 
-if ($UninstallWrapper) {
-    Uninstall-OldWrapper
-}
-elseif ($Install) {
-    Download-And-Install
-}
-elseif ($Config) {
-    Prompt-And-Save
-    Print-NextSteps
-}
-else {
-    if ($env:ADB_SETUP_SKIP_DOWNLOAD -ne '1') {
-        Download-And-Install
-        Write-Host ""
+    if ($UninstallWrapper) {
+        Uninstall-OldWrapper
     }
-    Prompt-And-Save
-    Print-NextSteps
+    elseif ($Install) {
+        Download-And-Install
+    }
+    elseif ($Config) {
+        Prompt-And-Save
+        Print-NextSteps
+    }
+    else {
+        if ($env:ADB_SETUP_SKIP_DOWNLOAD -ne '1') {
+            Download-And-Install
+            Write-Host ""
+        }
+        Prompt-And-Save
+        Print-NextSteps
+    }
+}
+
+# Run only when executed directly, not when dot-sourced (allows testing).
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Main
 }
