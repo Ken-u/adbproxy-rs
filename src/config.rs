@@ -279,7 +279,9 @@ pub fn legacy_config_path() -> PathBuf {
 }
 
 fn dirs_next_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Parse CLI `--backend name=host:port` or `host:port`.

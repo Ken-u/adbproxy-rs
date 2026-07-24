@@ -93,7 +93,9 @@ Legacy `~/.adbproxy` (`host=` / `port=`) is still loaded when the TOML config is
 
 ## Setup helper
 
-[`adb_setup.sh`](adb_setup.sh) downloads the latest GitHub Release for your OS/arch, installs `adb-hub` and `adb-proxy` into `~/.local/bin`, then writes the client TOML config. It does not replace the official `adb` binary.
+[`adb_setup.sh`](adb_setup.sh) (Linux / macOS) and [`adb_setup.ps1`](adb_setup.ps1) (Windows) download the latest GitHub Release for your OS/arch, install `adb-hub` and `adb-proxy` into `~/.local/bin`, then write the client TOML config. They do not replace the official `adb` binary.
+
+### Linux / macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.sh | bash
@@ -108,6 +110,30 @@ bash adb_setup.sh --uninstall-wrapper    # remove legacy PATH wrapper
 ```
 
 Install directory override: `ADB_PROXY_INSTALL_DIR=~/bin`.
+
+### Windows (PowerShell)
+
+```powershell
+# Run from a PowerShell terminal (Network access required for the one-time download)
+.\adb_setup.ps1
+```
+
+Or inline:
+
+```powershell
+irm https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.ps1 | iex
+```
+
+Useful flags:
+
+```powershell
+.\adb_setup.ps1 -Install    # download + install only
+.\adb_setup.ps1 -Config     # interactive config only
+```
+
+Install directory override: `$env:ADB_PROXY_INSTALL_DIR = "$HOME\bin"`.
+
+> **Note** — Windows uses `tar` (bundled since Windows 10 1803) to extract the archive, and writes config to `%USERPROFILE%\.config\adb-hub\config.toml`. If the install directory is not on `PATH`, the script offers to append it to the user-level `PATH`.
 
 ## Binary usage
 
