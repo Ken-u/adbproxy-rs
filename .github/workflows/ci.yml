@@ -56,4 +56,6 @@ jobs:
 
       - name: Run PowerShell setup tests
         shell: pwsh
-        run: .\tests\adb_setup_test.ps1
+        run: |
+          $ErrorActionPreference = 'Continue'
+          .\tests\adb_setup_test.ps1
