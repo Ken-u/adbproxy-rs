@@ -21,14 +21,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Repo         = if ($env:ADB_PROXY_REPO) { $env:ADB_PROXY_REPO } else { 'Ken-u/adbproxy-rs' }
-$InstallDir   = if ($env:ADB_PROXY_INSTALL_DIR) { $env:ADB_PROXY_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
-$ConfigDir    = Join-Path $env:APPDATA 'adb-hub'
-$ConfigFile   = Join-Path $ConfigDir 'config.toml'
-$LegacyConfig = Join-Path $HOME '.adbproxy'
-$ApiBase      = "https://api.github.com/repos/$Repo"
-$ReleaseBase  = "https://github.com/$Repo/releases/download"
-$WrapperMarker = '# adb-wrapper'
+$script:Repo         = if ($env:ADB_PROXY_REPO) { $env:ADB_PROXY_REPO } else { 'Ken-u/adbproxy-rs' }
+$script:InstallDir   = if ($env:ADB_PROXY_INSTALL_DIR) { $env:ADB_PROXY_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
+$script:ConfigDir    = Join-Path $env:APPDATA 'adb-hub'
+$script:ConfigFile   = Join-Path $script:ConfigDir 'config.toml'
+$script:LegacyConfig = Join-Path $HOME '.adbproxy'
+$script:ApiBase      = "https://api.github.com/repos/$($script:Repo)"
+$script:ReleaseBase  = "https://github.com/$($script:Repo)/releases/download"
+$script:WrapperMarker = '# adb-wrapper'
 
 function Show-Help {
     Write-Host @"
@@ -62,7 +62,7 @@ function Test-Name([string]$n) {
 }
 
 function Fetch-LatestTag {
-    $resp = Invoke-RestMethod -Uri "$ApiBase/releases/latest" -Headers @{ 'User-Agent' = 'adb_setup.ps1' }
+    $resp = Invoke-RestMethod -Uri "$($script:ApiBase)/releases/latest" -Headers @{ 'User-Agent' = 'adb_setup.ps1' }
     if (-not $resp.tag_name) {
         throw "could not parse latest release tag from GitHub."
     }
@@ -72,14 +72,14 @@ function Fetch-LatestTag {
 function Download-And-Install {
     $archive = 'adb-proxy-windows-x86_64.tar.gz'
     $tag     = Fetch-LatestTag
-    $url     = "$ReleaseBase/$tag/$archive"
+    $url     = "$script:ReleaseBase/$tag/$archive"
 
     Write-Host "Installing adb-hub + adb-proxy $tag"
     Write-Host "  archive: $archive"
     Write-Host "  from:    $url"
-    Write-Host "  into:    $InstallDir"
+    Write-Host "  into:    $script:InstallDir"
 
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:InstallDir | Out-Null
     $tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "adb_setup_$(Get-Random)")
     try {
         $archivePath = Join-Path $tmp $archive
@@ -93,7 +93,7 @@ function Download-And-Install {
 
         foreach ($bin in 'adb-hub', 'adb-proxy') {
             $src = Join-Path $staging "$bin.exe"
-            $dst = Join-Path $InstallDir "$bin.exe"
+            $dst = Join-Path $script:InstallDir "$bin.exe"
             if (-not (Test-Path $src)) {
                 Write-Error "archive missing $bin.exe"
                 Get-ChildItem $staging | Format-Table
@@ -112,25 +112,25 @@ function Download-And-Install {
 
 function Ensure-PathHint {
     $pathUser = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($pathUser -and ($pathUser.Split(';') -contains $InstallDir)) { return }
+    if ($pathUser -and ($pathUser.Split(';') -contains $script:InstallDir)) { return }
 
     Write-Host ""
-    Write-Host "NOTE: $InstallDir is not in your user PATH."
+    Write-Host "NOTE: $($script:InstallDir) is not in your user PATH."
     if (-not $Host.UI.RawUI.WindowTitle -or -not [Environment]::UserInteractive) {
         Write-Host "Add this manually:"
-        Write-Host "  [Environment]::SetEnvironmentVariable('Path', `"$InstallDir;`$([Environment]::GetEnvironmentVariable('Path','User'))`", 'User')"
+        Write-Host "  [Environment]::SetEnvironmentVariable('Path', `"$($script:InstallDir);`$([Environment]::GetEnvironmentVariable('Path','User'))`", 'User')"
         return
     }
 
-    $ans = Read-Host "Append $InstallDir to user PATH? [Y/n]"
+    $ans = Read-Host "Append $($script:InstallDir) to user PATH? [Y/n]"
     if ($ans -match '^(n|no)$') { return }
-    $newPath = if ($pathUser) { "$InstallDir;$pathUser" } else { $InstallDir }
+    $newPath = if ($pathUser) { "$($script:InstallDir);$pathUser" } else { $script:InstallDir }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     Write-Host "Appended to user PATH — open a new terminal for it to take effect."
 }
 
 function Write-TomlConfig([string]$Name, [string]$Host_, [string]$Port) {
-    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:ConfigDir | Out-Null
     @"
 listen = "127.0.0.1:5037"
 poll_interval_ms = 1000
@@ -140,8 +140,8 @@ local_adb_port = 5039
 [[backend]]
 name = "$Name"
 addr = "${Host_}:$Port"
-"@ | Set-Content -Path $ConfigFile -Encoding UTF8
-    Write-Host "Wrote $ConfigFile"
+"@ | Set-Content -Path $script:ConfigFile -Encoding UTF8
+    Write-Host "Wrote $($script:ConfigFile)"
 }
 
 function Prompt-And-Save {
@@ -149,8 +149,8 @@ function Prompt-And-Save {
     $defaultHost  = ''
     $defaultPort  = '5038'
 
-    if (Test-Path $LegacyConfig) {
-        foreach ($line in Get-Content $LegacyConfig) {
+    if (Test-Path $script:LegacyConfig) {
+        foreach ($line in Get-Content $script:LegacyConfig) {
             if ($line -match '^\s*host\s*=\s*(.+?)\s*$') { $defaultHost = $Matches[1].Trim() }
             elseif ($line -match '^\s*port\s*=\s*(.+?)\s*$') { $defaultPort = $Matches[1].Trim() }
         }
@@ -190,15 +190,15 @@ function Prompt-And-Save {
 }
 
 function Print-NextSteps {
-    $hub   = Join-Path $InstallDir 'adb-hub.exe'
-    $proxy = Join-Path $InstallDir 'adb-proxy.exe'
+    $hub   = Join-Path $script:InstallDir 'adb-hub.exe'
+    $proxy = Join-Path $script:InstallDir 'adb-proxy.exe'
     Write-Host @"
 
 Done.
 
 Client (this machine):
   adb kill-server
-  $hub --config $ConfigFile
+  $hub --config $($script:ConfigFile)
   adb devices
 
 Device host (USB machine):
@@ -216,7 +216,7 @@ function Test-IsWrapperAdb([string]$Path) {
     $lines = Get-Content $Path -TotalCount 5 -ErrorAction SilentlyContinue
     if (-not $lines) { return $false }
     foreach ($line in $lines) {
-        if ($line -and $line.Contains($WrapperMarker)) { return $true }
+        if ($line -and $line.Contains($script:WrapperMarker)) { return $true }
     }
     return $false
 }
@@ -290,6 +290,8 @@ function Invoke-Main {
 }
 
 # Run only when executed directly, not when dot-sourced (allows testing).
+# When dot-sourced, $MyInvocation.InvocationName is '.'; when run directly
+# it is the script path.
 if ($MyInvocation.InvocationName -ne '.') {
     Invoke-Main
 }
