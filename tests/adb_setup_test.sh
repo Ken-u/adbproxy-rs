@@ -128,7 +128,73 @@ EOF
     assert_eq "proxy" "$("$install/adb-proxy")"
 }
 
+test_install_pinned_version_skips_latest_api() {
+    local tmp home install archive log
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    home="$tmp/home"
+    install="$tmp/bin"
+    log="$tmp/curl.log"
+    mkdir -p "$home" "$install" "$tmp/staging" "$tmp/path"
+
+    printf '#!/bin/sh\necho hub\n' > "$tmp/staging/adb-hub"
+    printf '#!/bin/sh\necho proxy\n' > "$tmp/staging/adb-proxy"
+    chmod +x "$tmp/staging/adb-hub" "$tmp/staging/adb-proxy"
+
+    archive="$(expected_archive_for_host)"
+    tar -C "$tmp/staging" -czf "$tmp/$archive" adb-hub adb-proxy
+
+    cat > "$tmp/path/curl" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url=""
+args=("\$@")
+i=0
+while [[ \$i -lt \${#args[@]} ]]; do
+  case "\${args[\$i]}" in
+    -o)
+      i=\$((i+1))
+      out="\${args[\$i]}"
+      ;;
+    -o*)
+      out="\${args[\$i]#-o}"
+      ;;
+    http*|file*)
+      url="\${args[\$i]}"
+      ;;
+  esac
+  i=\$((i+1))
+done
+printf '%s\n' "\$url" >> "$log"
+if [[ "\$url" == *"/releases/latest"* ]]; then
+  echo "should not query latest when --version is set" >&2
+  exit 1
+fi
+if [[ "\$url" != *"/releases/download/v1.2.3/"* ]]; then
+  echo "unexpected download url: \$url" >&2
+  exit 1
+fi
+if [[ -n "\$out" ]]; then
+  cp "$tmp/$archive" "\$out"
+  exit 0
+fi
+echo "unexpected curl: \$*" >&2
+exit 1
+EOF
+    chmod +x "$tmp/path/curl"
+
+    PATH="$install:$tmp/path:/usr/bin:/bin" \
+    HOME="$home" \
+    ADB_PROXY_INSTALL_DIR="$install" \
+    bash "$repo_root/adb_setup.sh" --install --version 1.2.3
+
+    [[ -x "$install/adb-hub" ]] || fail "adb-hub not installed for pinned version"
+    assert_contains "$(cat "$log")" "/releases/download/v1.2.3/"
+}
+
 test_setup_writes_toml
 test_setup_from_legacy_defaults
 test_install_from_mock_archive
+test_install_pinned_version_skips_latest_api
 echo "adb_setup_test.sh: ok"

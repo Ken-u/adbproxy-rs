@@ -10,6 +10,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::auth::authenticate_stream;
+use crate::compat::{evaluate_proxy_version, ProxyCompat, PROXY_VERSION_SERVICE};
 use crate::config::{BackendConfig, HubConfig};
 use crate::protocol::{read_okay_payload, read_packet, read_status, write_service};
 use crate::registry::DeviceRegistry;
@@ -28,6 +29,35 @@ pub async fn connect_backend(addr: SocketAddr, pair_code: Option<&str>) -> io::R
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "auth timeout"))??;
     }
     Ok(stream)
+}
+
+/// Query `proxy:version` from a remote adb-proxy (after pair-code auth).
+pub async fn fetch_proxy_version(
+    addr: SocketAddr,
+    pair_code: Option<&str>,
+) -> io::Result<String> {
+    let Some(code) = pair_code else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proxy version check requires a pair code",
+        ));
+    };
+    let mut stream = connect_backend(addr, Some(code)).await?;
+    write_service(&mut stream, PROXY_VERSION_SERVICE).await?;
+    let body = timeout(QUERY_TIMEOUT, read_okay_payload(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timeout"))??;
+    Ok(String::from_utf8_lossy(&body).trim().to_string())
+}
+
+/// Check whether a paired proxy meets `MIN_PROXY_VERSION`.
+pub async fn check_proxy_compat(addr: SocketAddr, pair_code: Option<&str>) -> ProxyCompat {
+    match fetch_proxy_version(addr, pair_code).await {
+        Ok(version) => evaluate_proxy_version(&version),
+        Err(err) => ProxyCompat::Unknown {
+            reason: err.to_string(),
+        },
+    }
 }
 
 /// Query `host:version` from an adb server; returns decimal ADB_SERVER_VERSION.
@@ -58,10 +88,31 @@ pub async fn fetch_devices_l(addr: SocketAddr, pair_code: Option<&str>) -> io::R
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Return backends that pass the proxy version gate (local / no pair code always pass).
+pub async fn filter_compatible_backends(backends: &[BackendConfig]) -> Vec<BackendConfig> {
+    let mut out = Vec::new();
+    for backend in backends {
+        if backend.pair_code.is_none() {
+            out.push(backend.clone());
+            continue;
+        }
+        let compat = check_proxy_compat(backend.addr, backend.pair_code.as_deref()).await;
+        let msg = compat.user_message(&backend.name, backend.addr);
+        if compat.is_ok() {
+            debug!("{msg}");
+            out.push(backend.clone());
+        } else {
+            warn!("{msg}");
+        }
+    }
+    out
+}
+
 /// One-shot poll of every backend (used before hub accepts clients).
 pub async fn poll_backends_once(config: &HubConfig, registry: &DeviceRegistry) {
+    let backends = filter_compatible_backends(&config.backends).await;
     let mut lists: Vec<(BackendConfig, String)> = Vec::new();
-    for backend in &config.backends {
+    for backend in &backends {
         match fetch_devices_l(backend.addr, backend.pair_code.as_deref()).await {
             Ok(body) => {
                 debug!(backend = %backend.name, addr = %backend.addr, "initial device poll ok");
@@ -78,6 +129,12 @@ pub async fn poll_backends_once(config: &HubConfig, registry: &DeviceRegistry) {
             }
         }
     }
+    // Keep incompatible backends visible as empty so serials disappear cleanly.
+    for backend in &config.backends {
+        if !lists.iter().any(|(b, _)| b.name == backend.name) {
+            lists.push((backend.clone(), String::new()));
+        }
+    }
     registry.update_from_backend_lists(&lists).await;
 }
 
@@ -87,10 +144,18 @@ pub async fn run_backend_poller(config: HubConfig, registry: DeviceRegistry) {
     let shared: Arc<Mutex<HashMap<String, (BackendConfig, String)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let compatible = filter_compatible_backends(&config.backends).await;
+    let compatible_names: std::collections::HashSet<String> =
+        compatible.iter().map(|b| b.name.clone()).collect();
+
     // Seed shared from a fresh poll so partial watcher publishes never wipe peers.
     {
         let mut guard = shared.lock().await;
         for backend in &config.backends {
+            if !compatible_names.contains(&backend.name) {
+                guard.insert(backend.name.clone(), (backend.clone(), String::new()));
+                continue;
+            }
             let body = match fetch_devices_l(backend.addr, backend.pair_code.as_deref()).await {
                 Ok(body) => body,
                 Err(err) => {
@@ -109,7 +174,7 @@ pub async fn run_backend_poller(config: HubConfig, registry: DeviceRegistry) {
     publish_shared(&registry, &shared, &config.backends).await;
 
     let mut tasks = Vec::new();
-    for backend in config.backends.clone() {
+    for backend in compatible {
         let registry = registry.clone();
         let shared = shared.clone();
         let order = config.backends.clone();

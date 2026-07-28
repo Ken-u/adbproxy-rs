@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod backend;
+pub mod compat;
 pub mod config;
 pub mod hub;
 pub mod local;
@@ -205,6 +206,18 @@ async fn proxy_connection(
     };
     let service = String::from_utf8_lossy(&service_payload).into_owned();
     debug!(client = %client_addr, service = %service, version = VERSION, "client service");
+
+    // Hub compatibility probe — answered locally, never forwarded upstream.
+    if service == crate::compat::PROXY_VERSION_SERVICE {
+        write_okay_payload(&mut client, VERSION.as_bytes()).await?;
+        return Ok(Some(ProxyStats {
+            client_addr,
+            target_addr,
+            bytes_client_to_server: 0,
+            bytes_server_to_client: 0,
+            duration: started.elapsed(),
+        }));
+    }
 
     if let Some(serial) = transport_serial(&service) {
         if !policy.is_enabled(serial) {

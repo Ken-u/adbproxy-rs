@@ -19,7 +19,7 @@ adb-hub :5037  ----TCP---->  adb-proxy :5038  -->  adb server :5037  --> USB
 
 `adb-hub` speaks just enough of the ADB host protocol to merge device lists. Other host services (`features`, `version`, `tport`, `transport`, …) are forwarded as-is to the owning backend (or the default/local adb server).
 
-Remote `adb-proxy` instances require an 8-character pair code (`A-Z0-9`) on every connection. The port may be open on the LAN, but ADB traffic is rejected until the hub authenticates with the matching code.
+Remote `adb-proxy` instances require an 8-character pair code (`A-Z0-9`) on every connection. The port may be open on the LAN, but ADB traffic is rejected until the hub authenticates with the matching code. `adb-hub` also checks the remote `adb-proxy` version (`proxy:version`); backends older than the hub's minimum are skipped and `pair` prints an upgrade hint.
 
 On Linux shared hosts, the same commands work for every OS user: the first `adb-hub` owns `:5037` and shared USB devices; later users automatically join and only see shared USB plus **their own** paired remotes. Pair codes never leave the user's process. Details: [docs/multi-user-design.md](docs/multi-user-design.md).
 
@@ -107,7 +107,7 @@ Legacy `~/.adbproxy` (`host=` / `port=`) is still loaded when the TOML config is
 
 ## Setup helper
 
-[`adb_setup.sh`](adb_setup.sh) (Linux / macOS) and [`adb_setup.ps1`](adb_setup.ps1) (Windows) download the latest GitHub Release for your OS/arch, install `adb-hub` and `adb-proxy` into `~/.local/bin`, then write the client TOML config. They do not replace the official `adb` binary.
+[`adb_setup.sh`](adb_setup.sh) (Linux / macOS) and [`adb_setup.ps1`](adb_setup.ps1) (Windows) download a GitHub Release for your OS/arch (latest by default), install `adb-hub` and `adb-proxy` into `~/.local/bin`, then write the client TOML config. They do not replace the official `adb` binary.
 
 ### Linux / macOS
 
@@ -118,9 +118,10 @@ curl -fsSL https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.sh
 Useful flags:
 
 ```bash
-bash adb_setup.sh --install              # download + install only
-bash adb_setup.sh --config               # config only
-bash adb_setup.sh --uninstall-wrapper    # remove legacy PATH wrapper
+bash adb_setup.sh --install                    # download + install only
+bash adb_setup.sh --install --version 0.4.4    # pin a release (also accepts v0.4.4)
+bash adb_setup.sh --config                     # config only
+bash adb_setup.sh --uninstall-wrapper          # remove legacy PATH wrapper
 ```
 
 Install directory override: `ADB_PROXY_INSTALL_DIR=~/bin`.
@@ -141,9 +142,10 @@ irm https://raw.githubusercontent.com/Ken-u/adbproxy-rs/main/adb_setup.ps1 | iex
 Useful flags:
 
 ```powershell
-.\adb_setup.ps1 -Install             # download + install only
-.\adb_setup.ps1 -Config              # interactive config only
-.\adb_setup.ps1 -UninstallWrapper    # remove legacy PATH wrapper
+.\adb_setup.ps1 -Install                    # download + install only
+.\adb_setup.ps1 -Install -Version 0.4.4     # pin a release (also accepts v0.4.4)
+.\adb_setup.ps1 -Config                     # interactive config only
+.\adb_setup.ps1 -UninstallWrapper           # remove legacy PATH wrapper
 ```
 
 Install directory override: `$env:ADB_PROXY_INSTALL_DIR = "$HOME\bin"`.
@@ -269,6 +271,7 @@ Implemented:
 - On Linux: shared listener + per-user backends automatically (no separate agent command needed)
 - Elsewhere: same CLI runs the classic in-process aggregator
 - `adb-hub pair|unpair|list` persists backends + pair codes (owner-only config mode on Unix)
+- Hub rejects / skips paired proxies below the required `adb-proxy` version (`proxy:version`)
 - Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
 - Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend

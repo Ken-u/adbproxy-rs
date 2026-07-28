@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::authenticate_stream;
-use crate::backend::fetch_devices_l;
+use crate::backend::{fetch_devices_l, filter_compatible_backends};
 use crate::config::{default_config_path, HubConfig, ReloadableHubPolicy};
 use crate::ipc::{
     read_message, write_message, DeviceSnapshotMsg, IpcMessage, OpenResult, PROTOCOL_VERSION,
@@ -78,6 +78,24 @@ struct RouteEntry {
 
 type SharedWriter = Arc<Mutex<WriteHalf<UnixStream>>>;
 
+/// Cached proxy-version gate: fingerprint of backends → compatible names.
+type CompatCache = Arc<Mutex<(String, std::collections::HashSet<String>)>>;
+
+fn backends_fingerprint(backends: &[crate::config::BackendConfig]) -> String {
+    backends
+        .iter()
+        .map(|b| {
+            format!(
+                "{}@{}#{}",
+                b.name,
+                b.addr,
+                b.pair_code.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     run_agent_with_shutdown(config, std::future::pending::<()>()).await
 }
@@ -111,23 +129,40 @@ pub async fn run_agent_with_shutdown(
     let routes: Arc<Mutex<HashMap<String, RouteEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let compat_cache: CompatCache = Arc::new(Mutex::new((String::new(), Default::default())));
 
     let mut generation = 0u64;
-    if let Err(err) = refresh_and_publish(&config, &routes, &writer, &mut generation, false).await {
+    if let Err(err) = refresh_and_publish(
+        &config,
+        &routes,
+        &writer,
+        &compat_cache,
+        &mut generation,
+        false,
+    )
+    .await
+    {
         warn!(error = %err, "initial agent snapshot failed");
     }
 
     let poll_config = config.clone();
     let poll_routes = routes.clone();
     let poll_writer = writer.clone();
+    let poll_compat = compat_cache.clone();
     let poll_interval = config.poll_interval;
     let poller = tokio::spawn(async move {
         let mut generation = generation;
         loop {
             tokio::time::sleep(poll_interval).await;
-            if let Err(err) =
-                refresh_and_publish(&poll_config, &poll_routes, &poll_writer, &mut generation, true)
-                    .await
+            if let Err(err) = refresh_and_publish(
+                &poll_config,
+                &poll_routes,
+                &poll_writer,
+                &poll_compat,
+                &mut generation,
+                true,
+            )
+            .await
             {
                 warn!(error = %err, "agent snapshot publish failed");
                 break;
@@ -168,6 +203,7 @@ async fn refresh_and_publish(
     config: &AgentConfig,
     routes: &Arc<Mutex<HashMap<String, RouteEntry>>>,
     writer: &SharedWriter,
+    compat_cache: &CompatCache,
     generation: &mut u64,
     changed: bool,
 ) -> io::Result<()> {
@@ -190,8 +226,24 @@ async fn refresh_and_publish(
     hub_cfg.backends.retain(|b| b.enabled);
     let policy = ReloadableHubPolicy::from_config(&hub_cfg);
 
+    let enabled = hub_cfg.enabled_backends();
+    let fp = backends_fingerprint(&enabled);
+    let compatible_names = {
+        let mut cache = compat_cache.lock().await;
+        if cache.0 != fp {
+            let compatible = filter_compatible_backends(&enabled).await;
+            cache.0 = fp;
+            cache.1 = compatible.into_iter().map(|b| b.name).collect();
+        }
+        cache.1.clone()
+    };
+
     let mut lists = Vec::new();
-    for backend in hub_cfg.enabled_backends() {
+    for backend in enabled {
+        if !compatible_names.contains(&backend.name) {
+            lists.push((backend, String::new()));
+            continue;
+        }
         match fetch_devices_l(backend.addr, backend.pair_code.as_deref()).await {
             Ok(body) => lists.push((backend, body)),
             Err(err) => {

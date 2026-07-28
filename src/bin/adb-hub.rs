@@ -4,7 +4,8 @@ use std::process;
 use std::time::Duration;
 
 use adb_proxy::auth::{authenticate_stream, validate_pair_code};
-use adb_proxy::backend::fetch_devices_l;
+use adb_proxy::backend::{check_proxy_compat, fetch_devices_l};
+use adb_proxy::compat::MIN_PROXY_VERSION;
 use adb_proxy::config::{
     default_backend_name, default_config_path, legacy_config_path, old_config_path,
     parse_backend_arg, BackendConfig, HubConfig,
@@ -230,6 +231,20 @@ async fn run_pair(
     authenticate_stream(&mut stream, code).await?;
     drop(stream);
 
+    let backend_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| default_backend_name(addr));
+
+    let compat = check_proxy_compat(addr, Some(code)).await;
+    if !compat.is_ok() {
+        eprintln!("{}", compat.user_message(&backend_name, addr));
+        eprintln!(
+            "hint: upgrade adb-proxy on {addr} to >= {MIN_PROXY_VERSION}, then re-run pair \
+             (config was not updated)."
+        );
+        return Err(format!("incompatible adb-proxy version on {addr}").into());
+    }
+
     let path = config_path.cloned().unwrap_or_else(default_config_path);
     let mut config = if path.is_file() {
         HubConfig::load_file(&path)?
@@ -237,9 +252,6 @@ async fn run_pair(
         HubConfig::local_only()
     };
 
-    let backend_name = name
-        .map(str::to_string)
-        .unwrap_or_else(|| default_backend_name(addr));
     config.upsert_backend(BackendConfig {
         name: backend_name.clone(),
         addr,
@@ -248,10 +260,12 @@ async fn run_pair(
     });
     config.save_file(&path)?;
 
-    println!(
-        "paired backend '{backend_name}' at {addr} (pair_code saved to {})",
-        path.display()
-    );
+    if let adb_proxy::compat::ProxyCompat::Ok { version } = &compat {
+        println!(
+            "paired backend '{backend_name}' at {addr} (adb-proxy {version}, pair_code saved to {})",
+            path.display()
+        );
+    }
     Ok(())
 }
 

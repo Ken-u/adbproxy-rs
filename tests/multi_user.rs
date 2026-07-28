@@ -62,7 +62,9 @@ async fn mock_backend(listener: TcpListener, serial: &'static str, pair: Option<
                 };
                 service = String::from_utf8_lossy(&req2).into_owned();
             }
-            if service == "host:devices-l" {
+            if service == "proxy:version" {
+                let _ = write_okay_payload(&mut socket, adb_proxy::VERSION.as_bytes()).await;
+            } else if service == "host:devices-l" {
                 let body = format!("{serial}\tdevice\n");
                 let _ = write_okay_payload(&mut socket, body.as_bytes()).await;
             } else if let Some(s) = service.strip_prefix("host:transport:") {

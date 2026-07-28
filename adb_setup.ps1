@@ -1,10 +1,11 @@
-# Install latest adb-hub + adb-proxy from GitHub Releases and write client config.
+# Install adb-hub + adb-proxy from GitHub Releases and write client config.
 # Does not replace the official adb binary.
 #
 # Usage:
 #   .\adb_setup.ps1                 # download + install, then interactive config
 #   .\adb_setup.ps1 -Install        # download + install only
 #   .\adb_setup.ps1 -Config         # interactive config only
+#   .\adb_setup.ps1 -Version 0.4.4  # pin a release tag (with or without leading v)
 #   .\adb_setup.ps1 -UninstallWrapper  # remove legacy PATH wrapper
 #
 # Environment:
@@ -16,6 +17,7 @@ param(
     [switch]$Install,
     [switch]$Config,
     [switch]$UninstallWrapper,
+    [string]$Version = '',
     [switch]$Help
 )
 
@@ -29,21 +31,27 @@ $script:LegacyConfig = Join-Path $HOME '.adbproxy'
 $script:ApiBase      = "https://api.github.com/repos/$($script:Repo)"
 $script:ReleaseBase  = "https://github.com/$($script:Repo)/releases/download"
 $script:WrapperMarker = '# adb-wrapper'
+$script:RequestedVersion = $Version
 
 function Show-Help {
     Write-Host @"
 adb-proxy / adb-hub setup
 
-Downloads the latest GitHub release for this OS/arch, installs adb-hub and
-adb-proxy into $InstallDir, and optionally writes client config.
+Downloads a GitHub release for this OS/arch (latest by default), installs
+adb-hub and adb-proxy into $InstallDir, and optionally writes client config.
 
 Usage:
   .\adb_setup.ps1                 Download+install, then interactive config
   .\adb_setup.ps1 -Install        Download+install only
   .\adb_setup.ps1 -Config         Interactive config only
+  .\adb_setup.ps1 -Version <tag>  Use release tag (with or without leading v)
   .\adb_setup.ps1 -UninstallWrapper
                                   Remove legacy PATH wrapper
   .\adb_setup.ps1 -Help
+
+Examples:
+  .\adb_setup.ps1 -Install -Version 0.4.4
+  .\adb_setup.ps1 -Version v0.4.3
 
 Environment:
   `$env:ADB_PROXY_INSTALL_DIR   Install directory (default: `$HOME\.local\bin)
@@ -69,9 +77,27 @@ function Fetch-LatestTag {
     return $resp.tag_name
 }
 
+function Normalize-ReleaseTag([string]$v) {
+    $v = $v.Trim()
+    if ($v.StartsWith('v') -or $v.StartsWith('V')) {
+        $v = $v.Substring(1)
+    }
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        throw "empty version."
+    }
+    return "v$v"
+}
+
+function Resolve-ReleaseTag {
+    if (-not [string]::IsNullOrWhiteSpace($script:RequestedVersion)) {
+        return Normalize-ReleaseTag $script:RequestedVersion
+    }
+    return Fetch-LatestTag
+}
+
 function Download-And-Install {
     $archive = 'adb-proxy-windows-x86_64.tar.gz'
-    $tag     = Fetch-LatestTag
+    $tag     = Resolve-ReleaseTag
     $url     = "$script:ReleaseBase/$tag/$archive"
 
     Write-Host "Installing adb-hub + adb-proxy $tag"
@@ -83,7 +109,11 @@ function Download-And-Install {
     $tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "adb_setup_$(Get-Random)")
     try {
         $archivePath = Join-Path $tmp $archive
-        Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing
+        } catch {
+            throw "failed to download $url — check that release tag '$tag' exists for $($script:Repo). $_"
+        }
 
         $staging = Join-Path $tmp 'extract'
         New-Item -ItemType Directory -Path $staging | Out-Null
@@ -206,6 +236,7 @@ Device host (USB machine):
   $proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 
 Re-run install only:   .\adb_setup.ps1 -Install
+Install a version:     .\adb_setup.ps1 -Install -Version 0.4.4
 Config only:           .\adb_setup.ps1 -Config
 Remove old wrapper:    .\adb_setup.ps1 -UninstallWrapper
 "@

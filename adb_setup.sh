@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install latest adb-hub + adb-proxy from GitHub Releases and write client config.
+# Install adb-hub + adb-proxy from GitHub Releases and write client config.
 # Does not replace the official adb binary.
 set -euo pipefail
 
@@ -11,6 +11,8 @@ LEGACY_CONFIG="${HOME}/.adbproxy"
 WRAPPER_MARKER="# adb-wrapper"
 API_BASE="https://api.github.com/repos/${REPO}"
 RELEASE_BASE="https://github.com/${REPO}/releases/download"
+# Empty = latest release. Set via --version / -v.
+REQUESTED_VERSION=""
 
 resolve_executable() {
     local target="${1:-}"
@@ -99,13 +101,32 @@ fetch_latest_tag() {
     printf '%s\n' "$tag"
 }
 
+# Accept "0.4.4" or "v0.4.4" → always "v0.4.4".
+normalize_release_tag() {
+    local v="$1"
+    v="${v#v}"
+    if [[ -z "$v" ]]; then
+        echo "Error: empty version." >&2
+        exit 1
+    fi
+    printf 'v%s\n' "$v"
+}
+
+resolve_release_tag() {
+    if [[ -n "$REQUESTED_VERSION" ]]; then
+        normalize_release_tag "$REQUESTED_VERSION"
+    else
+        fetch_latest_tag
+    fi
+}
+
 download_and_install() {
     need_cmd curl
     need_cmd tar
 
     local archive tag url tmp staging
     archive="$(detect_archive_name)"
-    tag="$(fetch_latest_tag)"
+    tag="$(resolve_release_tag)"
     url="${RELEASE_BASE}/${tag}/${archive}"
 
     echo "Installing adb-hub + adb-proxy ${tag}"
@@ -118,7 +139,11 @@ download_and_install() {
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
 
-    curl -fL --progress-bar -o "${tmp}/${archive}" "$url"
+    if ! curl -fL --progress-bar -o "${tmp}/${archive}" "$url"; then
+        echo "Error: failed to download ${url}" >&2
+        echo "Hint: check that release tag '${tag}' exists for ${REPO}." >&2
+        exit 1
+    fi
     staging="${tmp}/extract"
     mkdir -p "$staging"
     tar -xzf "${tmp}/${archive}" -C "$staging"
@@ -297,6 +322,7 @@ Device host (USB machine):
   ${proxy} --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 
 Re-run install only:   $0 --install
+Install a version:     $0 --install --version 0.4.4
 Config only:           $0 --config
 Remove old wrapper:    $0 --uninstall-wrapper
 EOF
@@ -306,15 +332,20 @@ show_help() {
     cat <<EOF
 adb-proxy / adb-hub setup
 
-Downloads the latest GitHub release for this OS/arch, installs adb-hub and
-adb-proxy into ${INSTALL_DIR}, and optionally writes client config.
+Downloads a GitHub release for this OS/arch (latest by default), installs
+adb-hub and adb-proxy into ${INSTALL_DIR}, and optionally writes client config.
 
 Usage:
-  adb_setup.sh                 Download+install, then interactive config
-  adb_setup.sh --install       Download+install only
-  adb_setup.sh --config        Interactive config only
+  adb_setup.sh                      Download+install, then interactive config
+  adb_setup.sh --install            Download+install only
+  adb_setup.sh --config             Interactive config only
   adb_setup.sh --uninstall-wrapper
+  adb_setup.sh --version <tag>      Use release tag (with or without leading v)
   adb_setup.sh --help
+
+Examples:
+  adb_setup.sh --install --version 0.4.4
+  adb_setup.sh --version v0.4.3
 
 Environment:
   ADB_PROXY_INSTALL_DIR   Install directory (default: ~/.local/bin)
@@ -333,27 +364,62 @@ run_default() {
 }
 
 main() {
-    case "${1:-}" in
-        --help|-h)
-            show_help
-            ;;
-        --install)
+    local mode=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_help
+                return 0
+                ;;
+            --install)
+                mode="install"
+                shift
+                ;;
+            --config)
+                mode="config"
+                shift
+                ;;
+            --uninstall-wrapper)
+                mode="uninstall-wrapper"
+                shift
+                ;;
+            --version|-v)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    echo "Error: $1 requires a value (e.g. 0.4.4 or v0.4.4)." >&2
+                    exit 1
+                fi
+                REQUESTED_VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                REQUESTED_VERSION="${1#--version=}"
+                if [[ -z "$REQUESTED_VERSION" ]]; then
+                    echo "Error: --version= requires a value." >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                show_help >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$mode" in
+        install)
             download_and_install
             ;;
-        --config)
+        config)
             prompt_and_save
             print_next_steps
             ;;
-        --uninstall-wrapper)
+        uninstall-wrapper)
             uninstall_old_wrapper
             ;;
         "")
             run_default
-            ;;
-        *)
-            echo "Unknown option: $1" >&2
-            show_help >&2
-            exit 1
             ;;
     esac
 }
