@@ -1,10 +1,13 @@
 # Multi-user shared-server design
 
-Status: implemented for Linux (same network namespace). Single-user `adb-hub`
-remains the default elsewhere.
+Status: implemented. User-facing CLI is unified — every user runs the same
+`adb-hub` / `adb-hub --daemon` commands. Internally, Linux uses a shared
+`:5037` daemon plus a per-user agent; other platforms silently use the classic
+in-process aggregator.
 
-This document describes a multi-user mode for a server on which many OS users
-run the original `adb` client. The existing single-user mode remains unchanged.
+This document describes how many OS users on one Linux server can share the
+default `127.0.0.1:5037` endpoint while keeping pair codes and remote backends
+private. The public workflow does not distinguish “single-user” vs “multi-user”.
 
 ## Requirements
 
@@ -20,40 +23,43 @@ run the original `adb` client. The existing single-user mode remains unchanged.
    must not affect another user's remote backends.
 5. The server's physical ADB backend is started only once and is visible to all
    users.
+6. Users should not need separate “daemon” vs “agent” commands for normal use.
 
 ## Core decision
 
-Multi-user mode has two process roles:
+Internally there are still two roles (daemon + agent), but one CLI starts both
+when needed:
 
 ```text
-                         one per server
+                         one shared listener (first adb-hub on the host)
                     +----------------------+
-original adb :5037 ->|      adb-hubd        |
+original adb :5037 ->|   shared data plane  |
                     | accept + UID routing |
                     | shared local devices |
                     +----------+-----------+
                                |
                   custom, authenticated IPC
                      /                     \
-            one per logged-in user   one per logged-in user
+            embedded in each user's   embedded in each user's
+            `adb-hub --daemon`        `adb-hub --daemon`
             +------------------+     +------------------+
-            | Alice adb-hub    |     | Bob adb-hub      |
-            | Alice config     |     | Bob config       |
-            | Alice pair codes |     | Bob pair codes   |
             | Alice backends   |     | Bob backends     |
+            | Alice pair codes |     | Bob pair codes   |
             +------------------+     +------------------+
 ```
 
-`adb-hubd` is deliberately a thin common data-plane service. It owns the
-shared `5037` listener and the server-local ADB backend, identifies the OS user
-behind each local ADB connection, and routes private-device requests to that
-user's agent.
+The shared data plane owns `:5037` and the server-local ADB backend, identifies
+the OS user behind each local ADB connection, and routes private-device requests
+to that user's agent.
 
-Each user's `adb-hub` agent reads only that user's existing configuration,
-authenticates to the user's paired `adb-proxy` backends, polls their device
-lists, and opens private backend sessions on behalf of `adb-hubd`.
+Each user's agent (started automatically by `adb-hub --daemon`) reads only that
+user's configuration, authenticates to paired `adb-proxy` backends, polls their
+device lists, and opens private backend sessions on behalf of the shared plane.
 
 Pair codes never need to cross the agent/daemon boundary.
+
+If `:5037` is already owned by another user's hub, later `adb-hub --daemon`
+processes only register their agent and join the existing listener.
 
 ## Why an agent is required
 
@@ -68,7 +74,7 @@ The per-user agent avoids both problems:
   location);
 - it performs `auth:<pair-code>` directly against `adb-proxy`;
 - it sends only sanitized device metadata, route identifiers, status, and
-  proxied ADB stream data to `adb-hubd`.
+  proxied ADB stream data to the shared data plane.
 
 An agent must never send a pair code in registration, logs, device snapshots,
 or error messages.
@@ -103,15 +109,15 @@ transport. It must not trust a UID, username, PID, or SID supplied in the
 protocol payload.
 
 On Linux the control endpoint is an `AF_UNIX` socket and the daemon uses
-`SO_PEERCRED`. An abstract Unix socket is preferred when `adb-hubd` is started
-without administrator-managed `/run` storage.
+`SO_PEERCRED`. An abstract Unix socket is preferred when the shared listener is
+started without administrator-managed `/run` storage.
 
 Only one live agent is allowed for a UID by default. A reconnect atomically
 replaces a stale connection after an instance-token/heartbeat check.
 
 ### Original ADB connection
 
-`adb-hubd` accepts the original ADB client's TCP connection on
+The shared data plane accepts the original ADB client's TCP connection on
 `127.0.0.1:5037`. On Linux it obtains the peer tuple and queries
 `NETLINK_SOCK_DIAG`/`inet_diag`. The matching client socket contains
 `idiag_uid`, which selects the tenant.
@@ -150,7 +156,7 @@ agent connection.
 
 ## ADB request routing
 
-For each accepted ADB connection, `adb-hubd`:
+For each accepted ADB connection, the shared data plane:
 
 1. resolves the client UID;
 2. reads only that UID's combined registry;
@@ -168,7 +174,7 @@ Requests naming a private serial not present in the caller's registry return
 
 ## Shared server devices
 
-Only `adb-hubd` starts or adopts the real server-local ADB server, on an
+Only the shared data plane starts or adopts the real server-local ADB server, on an
 internal side port such as `5039`. Per-user agents must not call the current
 `LocalAdb::prepare()` path.
 
@@ -191,29 +197,32 @@ or command-authorization design and is not part of this proposal.
 
 ## Pairing and lifecycle
 
-The existing per-user configuration location remains authoritative. Proposed
-commands are:
+The existing per-user configuration location remains authoritative. User
+commands:
 
 ```text
 adb-hub pair <addr> <code> [--name <name>]
 adb-hub unpair <name>
 adb-hub list
-adb-hub agent [--foreground]
-adb-hubd [--foreground]
+adb-hub --daemon          # recommended; same as plain `adb-hub`
+adb-hub                    # identical service entry
 ```
 
-Exact command names may change, but their roles must not:
+`adb-hubd` remains a compatibility alias for `adb-hub --daemon`. The hidden
+`adb-hub agent` subcommand is for advanced/testing use only.
+
+Roles:
 
 - pairing commands update only the caller's configuration;
-- the user's agent reloads that configuration;
-- `adb-hubd` never opens another user's configuration;
-- `adb-hubd` is a singleton for the network namespace;
-- starting a second daemon connects to or reports the existing daemon instead
-  of replacing it.
+- the caller's agent reloads that configuration;
+- the shared data plane never opens another user's configuration;
+- the shared `:5037` listener is a singleton for the network namespace;
+- if the listen port is already taken by a compatible hub, a new process joins
+  as an agent instead of replacing the listener.
 
-An unprivileged first user may start `adb-hubd` because port 5037 is not a
-privileged port. The implementation must handle simultaneous startup attempts
-by relying on atomic socket binding and a control-protocol readiness check.
+An unprivileged first user may start the shared listener because port 5037 is
+not a privileged port. Simultaneous startup races are handled with atomic
+socket binding and control-socket connect retries.
 
 For reliable operation across logout and crashes, a platform service manager
 is recommended but is not required by the protocol design.
@@ -221,17 +230,18 @@ is recommended but is not required by the protocol design.
 ## Security boundary
 
 Per-user agents protect pair codes at rest and avoid central credential
-storage. They do not make an arbitrarily malicious common daemon harmless:
-`adb-hubd` sees and routes users' ADB traffic and can always deny service.
+storage. They do not make an arbitrarily malicious shared daemon harmless:
+the shared data plane sees and routes users' ADB traffic and can always deny
+service.
 
 Two deployment profiles are therefore defined:
 
-- **Cooperative host:** an unprivileged first user may auto-start the daemon.
-  This protects against accidental cross-user routing and pair-code disclosure,
-  but the daemon owner is trusted.
-- **Mutually untrusted users:** `adb-hubd` must run under a dedicated trusted
-  account or administrator-managed service. Users still retain their pair
-  codes in their own agents.
+- **Cooperative host:** an unprivileged first user may auto-start the shared
+  listener via `adb-hub --daemon`. This protects against accidental cross-user
+  routing and pair-code disclosure, but the process that owns `:5037` is trusted.
+- **Mutually untrusted users:** the shared listener should run under a dedicated
+  trusted account or administrator-managed service. Users still retain their
+  pair codes in their own agents (started by each user's `adb-hub --daemon`).
 
 Additional requirements:
 
@@ -245,25 +255,26 @@ Additional requirements:
 
 ## Platform support
 
-This table applies only to the shared-`5037` multi-user mode. Existing
-single-user `adb-hub` behavior remains supported on its current platforms.
+This table applies to the shared-`:5037` implementation. On unsupported
+platforms the same `adb-hub` / `adb-hub --daemon` CLI silently runs the classic
+in-process aggregator (one process owns that user's listen port).
 
 | Platform | Shared `5037` multi-user status | Reason / fallback |
 | --- | --- | --- |
-| Linux, same network namespace | Initial supported target | `NETLINK_SOCK_DIAG` provides the TCP socket owner UID; `AF_UNIX` provides authenticated agent identity. This must be validated on each supported distribution and hardening profile. |
-| Linux, different network namespaces/containers | Not supported by this mode | The daemon cannot resolve a client socket that is outside its network namespace. Run one hub per namespace, or use explicit per-user ports. |
-| macOS | Not supported initially | `getpeereid()` provides credentials for Unix-domain IPC, but this design has no documented, portable unprivileged equivalent for resolving the owner UID of an accepted loopback TCP peer. Use one port per user with `ADB_SERVER_SOCKET`. |
-| Windows | Not supported initially | Windows exposes TCP endpoint owner PIDs and socket duplication APIs, but secure PID-to-user/SID resolution and cross-session agent IPC require a separate Windows design and validation. Use one port per user with `ADB_SERVER_SOCKET`. |
-| Other Unix/BSD | Not supported | No implementation or security validation exists. Use one port per user or an isolated network namespace/container where available. |
+| Linux, same network namespace | Supported | `NETLINK_SOCK_DIAG` provides the TCP socket owner UID; `AF_UNIX` provides authenticated agent identity. |
+| Linux, different network namespaces/containers | Not supported by shared mode | The daemon cannot resolve a client socket outside its network namespace. Run one hub per namespace, or use explicit per-user ports. |
+| macOS | Classic aggregator | No portable unprivileged API to resolve the owner UID of an accepted loopback TCP peer. Same `adb-hub` CLI; use one port per user with `ADB_SERVER_SOCKET` if ports conflict. |
+| Windows | Classic aggregator | Shared UID routing not implemented. Same `adb-hub` CLI; use one port per user with `ADB_SERVER_SOCKET` if needed. |
+| Other Unix/BSD | Classic aggregator | No shared-mode validation. Same CLI fallback. |
 
-Unsupported platforms must reject `--multi-user`/`adb-hubd` mode with a clear
-error. They must not silently run a shared tenant or expose every user's
-devices.
+Shared mode must not silently expose every user's devices on an unsupported
+platform. The classic fallback only serves the calling user's own config.
 
-Fallback example:
+Fallback when multiple users need isolated ports on a non-shared platform:
 
 ```bash
 export ADB_SERVER_SOCKET=tcp:127.0.0.1:15037
+adb-hub --listen 127.0.0.1:15037 --daemon
 adb devices
 ```
 
@@ -273,16 +284,17 @@ default `5037`.
 ## Delivery phases
 
 1. Extract the current single-user hub session/router so it can operate against
-   a tenant registry.
-2. Add the Linux daemon, loopback-only listener, and TCP UID resolver.
-3. Add authenticated per-user agent registration and heartbeat handling.
-4. Move private backend polling/authentication into the agent protocol.
+   a tenant registry. **Done.**
+2. Add the Linux daemon, loopback-only listener, and TCP UID resolver. **Done.**
+3. Add authenticated per-user agent registration and heartbeat handling. **Done.**
+4. Move private backend polling/authentication into the agent protocol. **Done.**
 5. Move shared local ADB ownership into the daemon and add safe host-command
-   policy.
-6. Add startup/reconnect behavior and owner-only configuration permissions.
-7. Document and enforce unsupported-platform errors and fallback ports.
-8. Consider native macOS and Windows implementations only after dedicated
-   security and lifecycle designs are validated.
+   policy. **Done.**
+6. Add startup/reconnect behavior and owner-only configuration permissions. **Done.**
+7. Unify the CLI (`adb-hub --daemon`) so users do not manage daemon/agent
+   separately; unsupported platforms use the classic aggregator. **Done.**
+8. Consider native macOS and Windows shared-mode implementations only after
+   dedicated security and lifecycle designs are validated. **Open.**
 
 ## Acceptance criteria
 

@@ -185,14 +185,20 @@ enabled = false
 ### adb-hub (client)
 
 ```bash
-# Pair once
+# Pair once (per user)
 adb-hub pair 192.168.1.10:5038 ABCD1234 --name office
+adb-hub list
+adb-hub unpair office
 
-# Run hub
-adb-hub \
-  --listen 127.0.0.1:5037 \
-  --log-level info
+# Run hub — same command for one laptop or many users on a Linux server
+adb-hub --daemon
+# equivalent:
+# adb-hub
 ```
+
+On Linux, the first process owns `:5037` and shared USB devices; later users
+running the same command automatically join and only register their own paired
+remotes. On macOS/Windows the same CLI runs a classic in-process aggregator.
 
 Env: `ADB_HUB_LISTEN`, `ADB_HUB_CONFIG`, `ADB_HUB_POLL_MS`, `ADB_HUB_LOG`.
 
@@ -222,6 +228,7 @@ serial = "lab:ABC123"
 enabled = false
 ```
 
+`adb-hubd` is a compatibility alias for `adb-hub --daemon`.
 ## Release Artifacts
 
 GitHub Actions builds downloadable archives:
@@ -251,9 +258,8 @@ cargo test
 cargo build --bins
 cargo run --bin adb-proxy -- --listen 0.0.0.0:5038 --target 127.0.0.1:5037 --pair-code ABCD1234
 cargo run --bin adb-hub -- pair 127.0.0.1:5038 ABCD1234 --name mock
-cargo run --bin adb-hub -- --no-local
+cargo run --bin adb-hub -- --daemon
 ```
-
 ## Scope
 
 Implemented:
