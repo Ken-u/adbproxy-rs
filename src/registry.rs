@@ -170,6 +170,7 @@ mod tests {
             name: name.into(),
             addr: addr.parse().unwrap(),
             pair_code: None,
+            enabled: true,
         }
     }
 

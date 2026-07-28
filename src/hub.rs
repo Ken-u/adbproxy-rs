@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{fetch_server_version, run_backend_poller};
-use crate::config::{BackendConfig, HubConfig};
+use crate::config::{BackendConfig, HubConfig, ReloadableHubPolicy};
 use crate::local::LocalAdb;
 use crate::registry::DeviceRegistry;
 use crate::session::{handle_client, SessionContext};
@@ -41,6 +41,8 @@ pub async fn run_hub_with_shutdown(
     mut config: HubConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let policy = Arc::new(ReloadableHubPolicy::from_config(&config));
+
     // Keep LocalAdb alive for the hub lifetime so Drop can kill the side server.
     let _local_adb = if config.include_local {
         let local = LocalAdb::prepare(config.local_adb_port)
@@ -60,6 +62,7 @@ pub async fn run_hub_with_shutdown(
             name: LocalAdb::backend_name().to_string(),
             addr: local.addr,
             pair_code: None,
+            enabled: true,
         };
         config
             .backends
@@ -70,10 +73,13 @@ pub async fn run_hub_with_shutdown(
         None
     };
 
+    // Only poll / route through enabled backends (local always enabled above).
+    config.backends.retain(|b| b.enabled);
+
     if config.backends.is_empty() {
         return Err(HubError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "no backends configured",
+            "no backends configured (all nodes disabled?)",
         )));
     }
 
@@ -133,6 +139,7 @@ pub async fn run_hub_with_shutdown(
                     default_pair_code: default_pair_code.clone(),
                     backend_order: backend_order.clone(),
                     kill_notify: kill_notify.clone(),
+                    policy: policy.clone(),
                 };
                 tokio::spawn(async move {
                     if let Err(err) = handle_client(client, ctx).await {

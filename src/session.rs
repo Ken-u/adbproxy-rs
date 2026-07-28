@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::auth::authenticate_stream;
+use crate::config::ReloadableHubPolicy;
 use crate::protocol::{
     read_packet, write_fail, write_okay, write_okay_payload, write_packet, write_service,
 };
@@ -21,6 +22,8 @@ pub struct SessionContext {
     /// Configured backend names in order (local first when enabled).
     pub backend_order: Vec<String>,
     pub kill_notify: Arc<Notify>,
+    /// Device/node enable policy (reloaded from config by mtime).
+    pub policy: Arc<ReloadableHubPolicy>,
 }
 
 /// Handle one adb client connection.
@@ -50,14 +53,14 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
 
     if service == "host:devices" || service == "host:devices-l" {
         let long = service.ends_with("-l");
-        let body = ctx.registry.snapshot().await.format_devices(long);
+        let body = client_snapshot(&ctx).await.format_devices(long);
         write_okay_payload(&mut client, body.as_bytes()).await?;
         return Ok(());
     }
 
     if service == "host:track-devices" || service == "host:track-devices-l" {
         let long = service.ends_with("-l");
-        return track_devices(&mut client, &ctx.registry, long).await;
+        return track_devices(&mut client, &ctx, long).await;
     }
 
     if service == "host:kill" {
@@ -66,7 +69,7 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
         return Ok(());
     }
 
-    let snap = ctx.registry.snapshot().await;
+    let snap = client_snapshot(&ctx).await;
     match route_service(
         &service,
         &snap,
@@ -84,6 +87,11 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
             Ok(())
         }
     }
+}
+
+async fn client_snapshot(ctx: &SessionContext) -> DeviceSnapshot {
+    let snap = ctx.registry.snapshot().await;
+    ctx.policy.refresh().filter_snapshot(snap)
 }
 
 /// Decide which backend gets this service and what service string to send upstream.
@@ -296,19 +304,19 @@ async fn forward_session(
 
 async fn track_devices(
     client: &mut TcpStream,
-    registry: &DeviceRegistry,
+    ctx: &SessionContext,
     long: bool,
 ) -> io::Result<()> {
     write_okay(client).await?;
-    let mut rx = registry.subscribe();
+    let mut rx = ctx.registry.subscribe();
 
-    let body = registry.snapshot().await.format_devices(long);
+    let body = client_snapshot(ctx).await.format_devices(long);
     write_packet(client, body.as_bytes()).await?;
 
     loop {
         match rx.recv().await {
             Ok(()) => {
-                let body = registry.snapshot().await.format_devices(long);
+                let body = client_snapshot(ctx).await.format_devices(long);
                 if let Err(err) = write_packet(client, body.as_bytes()).await {
                     if is_benign(&err) {
                         return Ok(());
@@ -317,7 +325,7 @@ async fn track_devices(
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let body = registry.snapshot().await.format_devices(long);
+                let body = client_snapshot(ctx).await.format_devices(long);
                 write_packet(client, body.as_bytes()).await?;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),

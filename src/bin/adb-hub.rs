@@ -1,13 +1,16 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use adb_proxy::auth::{authenticate_stream, validate_pair_code};
+use adb_proxy::backend::fetch_devices_l;
 use adb_proxy::config::{
     default_backend_name, default_config_path, legacy_config_path, old_config_path,
     parse_backend_arg, BackendConfig, HubConfig,
 };
 use adb_proxy::hub::run_hub_with_shutdown;
+use adb_proxy::policy::DevicePolicyTable;
+use adb_proxy::registry::merge_device_lists;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
@@ -24,7 +27,7 @@ struct Args {
     listen: Option<SocketAddr>,
 
     /// Path to TOML config (default: %APPDATA%\adb-hub\config.toml on Windows,
-    /// ~/.config/adb-hub/config.toml on Linux/macOS)
+    /// ~/.config/adb-hub\config.toml on Linux/macOS)
     #[arg(long, env = "ADB_HUB_CONFIG", global = true)]
     config: Option<PathBuf>,
 
@@ -60,6 +63,30 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Manage device enable state (public serial)
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// Manage paired node (backend) enable state
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceAction {
+    List,
+    Enable { serial: String },
+    Disable { serial: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeAction {
+    List,
+    Enable { name: String },
+    Disable { name: String },
 }
 
 #[tokio::main]
@@ -67,29 +94,43 @@ async fn main() {
     let args = Args::parse();
     init_tracing(&args.log_level);
 
-    if let Some(Commands::Pair { addr, code, name }) = args.command {
-        if let Err(err) = run_pair(addr, &code, name.as_deref(), args.config.as_ref()).await {
-            eprintln!("adb-hub pair error: {err}");
-            process::exit(1);
+    match args.command {
+        Some(Commands::Pair { addr, code, name }) => {
+            if let Err(err) = run_pair(addr, &code, name.as_deref(), args.config.as_ref()).await {
+                eprintln!("adb-hub pair error: {err}");
+                process::exit(1);
+            }
         }
-        return;
-    }
-
-    let config = match build_config(&args) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("adb-hub config error: {err}");
-            process::exit(2);
+        Some(Commands::Device { action }) => {
+            if let Err(err) = run_device(action, args.config.as_ref()).await {
+                eprintln!("adb-hub device error: {err}");
+                process::exit(1);
+            }
         }
-    };
+        Some(Commands::Node { action }) => {
+            if let Err(err) = run_node(action, args.config.as_ref()) {
+                eprintln!("adb-hub node error: {err}");
+                process::exit(1);
+            }
+        }
+        None => {
+            let config = match build_config(&args) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("adb-hub config error: {err}");
+                    process::exit(2);
+                }
+            };
 
-    if let Err(err) = run_hub_with_shutdown(config, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
-    {
-        eprintln!("adb-hub error: {err}");
-        process::exit(1);
+            if let Err(err) = run_hub_with_shutdown(config, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            {
+                eprintln!("adb-hub error: {err}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -119,6 +160,7 @@ async fn run_pair(
         name: backend_name.clone(),
         addr,
         pair_code: Some(code.to_string()),
+        enabled: true,
     });
     config.save_file(&path)?;
 
@@ -126,6 +168,111 @@ async fn run_pair(
         "paired backend '{backend_name}' at {addr} (pair_code saved to {})",
         path.display()
     );
+    Ok(())
+}
+
+fn resolve_config_path(config_path: Option<&PathBuf>) -> PathBuf {
+    config_path.cloned().unwrap_or_else(default_config_path)
+}
+
+fn load_or_empty(path: &Path) -> Result<HubConfig, Box<dyn std::error::Error>> {
+    if path.is_file() {
+        Ok(HubConfig::load_file(path)?)
+    } else {
+        Ok(HubConfig::local_only())
+    }
+}
+
+async fn run_device(
+    action: DeviceAction,
+    config_path: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = resolve_config_path(config_path);
+    let mut config = load_or_empty(&path)?;
+
+    match action {
+        DeviceAction::Enable { serial } => {
+            config.set_device_enabled(&serial, true);
+            config.save_file(&path)?;
+            println!("enabled device '{serial}' ({})", path.display());
+        }
+        DeviceAction::Disable { serial } => {
+            config.set_device_enabled(&serial, false);
+            config.save_file(&path)?;
+            println!("disabled device '{serial}' ({})", path.display());
+        }
+        DeviceAction::List => {
+            let mut lists = Vec::new();
+            for backend in config.enabled_backends() {
+                match fetch_devices_l(backend.addr, backend.pair_code.as_deref()).await {
+                    Ok(body) => lists.push((backend, body)),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: poll {} ({}) failed: {err}",
+                            backend.name, backend.addr
+                        );
+                        lists.push((backend, String::new()));
+                    }
+                }
+            }
+            let snap = merge_device_lists(&lists);
+
+            println!(
+                "{:<28} {:<12} {:<10} NODE",
+                "SERIAL", "STATE", "ENABLED"
+            );
+            let mut seen = std::collections::HashSet::new();
+            for d in &snap.devices {
+                seen.insert(d.public_serial.clone());
+                let enabled = if config.devices.is_enabled(&d.public_serial) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                println!(
+                    "{:<28} {:<12} {:<10} {}",
+                    d.public_serial, d.state, enabled, d.backend_name
+                );
+            }
+            for (serial, enabled) in config.devices.explicit_serials() {
+                if !enabled && !seen.contains(serial) {
+                    println!("{serial:<28} {:<12} {:<10} -", "-", "no");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_node(
+    action: NodeAction,
+    config_path: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = resolve_config_path(config_path);
+    let mut config = load_or_empty(&path)?;
+
+    match action {
+        NodeAction::Enable { name } => {
+            config.set_backend_enabled(&name, true)?;
+            config.save_file(&path)?;
+            println!("enabled node '{name}' ({})", path.display());
+        }
+        NodeAction::Disable { name } => {
+            config.set_backend_enabled(&name, false)?;
+            config.save_file(&path)?;
+            println!("disabled node '{name}' ({})", path.display());
+        }
+        NodeAction::List => {
+            println!("{:<20} {:<24} ENABLED", "NAME", "ADDR");
+            for b in &config.backends {
+                let enabled = if b.enabled { "yes" } else { "no" };
+                println!("{:<20} {:<24} {enabled}", b.name, b.addr);
+            }
+            if config.backends.is_empty() {
+                println!("(no paired nodes)");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -142,6 +289,8 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
             adb_version: 41,
             include_local: !args.no_local,
             local_adb_port: args.local_port.unwrap_or(5039),
+            devices: DevicePolicyTable::default(),
+            config_path: None,
         }
     } else if let Some(path) = args.config.as_ref() {
         let mut c = HubConfig::load_file(path)?;
@@ -191,6 +340,10 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
     }
     unique.reverse();
     config.backends = unique;
+
+    if config.backends.iter().all(|b| !b.enabled) && !config.include_local {
+        return Err("no enabled backends configured; enable a node or use --local".into());
+    }
 
     if config.backends.is_empty() && !config.include_local {
         return Err("no backends configured; use --backend, a config file, or enable --local".into());

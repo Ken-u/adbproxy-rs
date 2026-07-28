@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use adb_proxy::config::{BackendConfig, HubConfig};
 use adb_proxy::hub::run_hub_with_shutdown;
+use adb_proxy::policy::DevicePolicyTable;
 use adb_proxy::protocol::{
     read_okay_payload, read_packet, read_status, write_fail, write_okay, write_okay_payload,
     write_packet, write_service,
@@ -10,6 +11,28 @@ use adb_proxy::protocol::{
 use adb_proxy::wait_for_port;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+
+fn backend(name: &str, addr: SocketAddr, pair_code: Option<&str>) -> BackendConfig {
+    BackendConfig {
+        name: name.into(),
+        addr,
+        pair_code: pair_code.map(str::to_string),
+        enabled: true,
+    }
+}
+
+fn hub_config(listen: SocketAddr, backends: Vec<BackendConfig>) -> HubConfig {
+    HubConfig {
+        listen,
+        poll_interval: Duration::from_millis(100),
+        backends,
+        adb_version: 41,
+        include_local: false,
+        local_adb_port: 5039,
+        devices: DevicePolicyTable::default(),
+        config_path: None,
+    }
+}
 
 /// Mock upstream that optionally requires an auth: frame first.
 async fn mock_backend(
@@ -98,18 +121,10 @@ async fn hub_lists_forwards_and_transports() {
         a
     };
 
-    let config = HubConfig {
-        listen: hub_addr,
-        poll_interval: Duration::from_millis(100),
-        backends: vec![BackendConfig {
-            name: "mock".into(),
-            addr: backend_addr,
-            pair_code: None,
-        }],
-        adb_version: 41,
-        include_local: false,
-        local_adb_port: 5039,
-    };
+    let config = hub_config(
+        hub_addr,
+        vec![backend("mock", backend_addr, None)],
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let hub = tokio::spawn(async move {
@@ -201,25 +216,13 @@ async fn hub_rewrites_conflicting_serials() {
         a
     };
 
-    let config = HubConfig {
-        listen: hub_addr,
-        poll_interval: Duration::from_millis(100),
-        backends: vec![
-            BackendConfig {
-                name: "office".into(),
-                addr: addr_a,
-                pair_code: None,
-            },
-            BackendConfig {
-                name: "lab".into(),
-                addr: addr_b,
-                pair_code: None,
-            },
+    let config = hub_config(
+        hub_addr,
+        vec![
+            backend("office", addr_a, None),
+            backend("lab", addr_b, None),
         ],
-        adb_version: 41,
-        include_local: false,
-        local_adb_port: 5039,
-    };
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -261,18 +264,10 @@ async fn hub_auths_to_paired_backend() {
         a
     };
 
-    let config = HubConfig {
-        listen: hub_addr,
-        poll_interval: Duration::from_millis(100),
-        backends: vec![BackendConfig {
-            name: "paired".into(),
-            addr: backend_addr,
-            pair_code: Some("ABCD1234".into()),
-        }],
-        adb_version: 41,
-        include_local: false,
-        local_adb_port: 5039,
-    };
+    let config = hub_config(
+        hub_addr,
+        vec![backend("paired", backend_addr, Some("ABCD1234"))],
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -291,6 +286,101 @@ async fn hub_auths_to_paired_backend() {
     let body = read_okay_payload(&mut c).await.unwrap();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("PAIRED1\tdevice"), "got: {text}");
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn hub_hides_disabled_device() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    tokio::spawn(mock_backend(backend_listener, "HIDE_ME", "", None));
+
+    let hub_addr: SocketAddr = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
+
+    let mut devices = DevicePolicyTable::default();
+    devices.set_enabled("HIDE_ME", false);
+    let mut config = hub_config(hub_addr, vec![backend("mock", backend_addr, None)]);
+    config.devices = devices;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        run_hub_with_shutdown(config, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut c = TcpStream::connect(hub_addr).await.unwrap();
+    write_service(&mut c, "host:devices").await.unwrap();
+    let body = read_okay_payload(&mut c).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("HIDE_ME"), "got: {text}");
+
+    let mut c = TcpStream::connect(hub_addr).await.unwrap();
+    write_service(&mut c, "host:transport:HIDE_ME").await.unwrap();
+    let status = read_status(&mut c).await.unwrap();
+    assert_eq!(&status, b"FAIL");
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn hub_skips_disabled_node() {
+    async fn serve(addr_out: oneshot::Sender<SocketAddr>, serial: &'static str) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ = addr_out.send(listener.local_addr().unwrap());
+        mock_backend(listener, serial, "", None).await;
+    }
+
+    let (tx_a, rx_a) = oneshot::channel();
+    let (tx_b, rx_b) = oneshot::channel();
+    tokio::spawn(serve(tx_a, "FROM_A"));
+    tokio::spawn(serve(tx_b, "FROM_B"));
+    let addr_a = rx_a.await.unwrap();
+    let addr_b = rx_b.await.unwrap();
+
+    let hub_addr: SocketAddr = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
+
+    let mut backends = vec![
+        backend("office", addr_a, None),
+        backend("lab", addr_b, None),
+    ];
+    backends[1].enabled = false;
+    let config = hub_config(hub_addr, backends);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        run_hub_with_shutdown(config, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut c = TcpStream::connect(hub_addr).await.unwrap();
+    write_service(&mut c, "host:devices").await.unwrap();
+    let body = read_okay_payload(&mut c).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("FROM_A\tdevice"), "got: {text}");
+    assert!(!text.contains("FROM_B"), "got: {text}");
 
     let _ = shutdown_tx.send(());
 }

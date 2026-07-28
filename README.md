@@ -150,9 +150,25 @@ adb-proxy \
   --log-level info
 ```
 
-Env: `ADB_PROXY_LISTEN`, `ADB_PROXY_TARGET`, `ADB_PROXY_PAIR_CODE`, `ADB_PROXY_LOG`.
+Env: `ADB_PROXY_LISTEN`, `ADB_PROXY_TARGET`, `ADB_PROXY_PAIR_CODE`, `ADB_PROXY_CONFIG`, `ADB_PROXY_LOG`.
 
 If `--pair-code` / `ADB_PROXY_PAIR_CODE` is omitted, a random 8-character `A-Z0-9` code is generated and logged at startup.
+
+Manage which USB devices this host exposes (default: all enabled):
+
+```bash
+adb-proxy device list
+adb-proxy device disable A0001XX
+adb-proxy device enable A0002XXX
+```
+
+Policy is stored in `~/.config/adb-proxy/config.toml` (Windows: `%APPDATA%\adb-proxy\config.toml`). Disabled devices are omitted from `host:devices` / `track-devices` and cannot be transported. Changes apply without restarting the proxy.
+
+```toml
+[[device]]
+serial = "A0001XX"
+enabled = false
+```
 
 ### adb-hub (client)
 
@@ -167,6 +183,32 @@ adb-hub \
 ```
 
 Env: `ADB_HUB_LISTEN`, `ADB_HUB_CONFIG`, `ADB_HUB_POLL_MS`, `ADB_HUB_LOG`.
+
+Device and node enable state (public serial for devices; backend name for nodes):
+
+```bash
+adb-hub device list
+adb-hub device disable office:A0001XX
+adb-hub device enable A0002XXX
+
+adb-hub node list
+adb-hub node disable office
+adb-hub node enable office
+```
+
+When a node is disabled, none of its devices appear in the aggregated list. Omit `enabled` or set `enabled = true` to keep the default (enabled).
+
+```toml
+[[backend]]
+name = "office"
+addr = "192.168.1.10:5038"
+pair_code = "ABCD1234"
+enabled = false
+
+[[device]]
+serial = "lab:ABC123"
+enabled = false
+```
 
 ## Release Artifacts
 
@@ -212,6 +254,8 @@ Implemented:
 - Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend
 - `host:version`, `host:devices` / `devices-l`, `host:track-devices`, `host:transport:*`, `host:transport-any`, `host:kill`, `host-serial:*` forwarding
 - TOML config + legacy `~/.adbproxy` + CLI `--backend`
+- Per-device enable/disable on proxy and hub (`device list|enable|disable`)
+- Per-node enable/disable on hub (`node list|enable|disable`)
 
 Not in this phase:
 

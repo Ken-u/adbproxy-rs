@@ -1,11 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::policy::{DevicePolicyEntry, DevicePolicyTable};
+use crate::registry::DeviceSnapshot;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendConfig {
@@ -13,6 +18,8 @@ pub struct BackendConfig {
     pub addr: SocketAddr,
     /// Pair code for remote adb-proxy auth; None for local adb.
     pub pair_code: Option<String>,
+    /// When false, backend is not polled and its devices are hidden.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +33,10 @@ pub struct HubConfig {
     pub include_local: bool,
     /// Side port for the real local adb server (hub keeps :5037).
     pub local_adb_port: u16,
+    /// Per-device enable policy (public serial). Missing / true = enabled.
+    pub devices: DevicePolicyTable,
+    /// Path this config was loaded from (runtime policy reload). Not serialized.
+    pub config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -57,6 +68,8 @@ struct TomlFile {
     local_adb_port: u16,
     #[serde(default)]
     backend: Vec<TomlBackend>,
+    #[serde(default)]
+    device: Vec<DevicePolicyEntry>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -65,6 +78,16 @@ struct TomlBackend {
     addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pair_code: Option<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 fn default_listen() -> String {
@@ -129,6 +152,7 @@ impl HubConfig {
                 name,
                 addr,
                 pair_code: b.pair_code,
+                enabled: b.enabled,
             });
         }
 
@@ -145,12 +169,16 @@ impl HubConfig {
             adb_version: parsed.adb_version,
             include_local: parsed.include_local,
             local_adb_port: parsed.local_adb_port,
+            devices: DevicePolicyTable::from_entries(parsed.device),
+            config_path: None,
         })
     }
 
     pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)?;
-        Self::from_toml_str(&text)
+        let mut cfg = Self::from_toml_str(&text)?;
+        cfg.config_path = Some(path.to_path_buf());
+        Ok(cfg)
     }
 
     /// Serialize current config to TOML text.
@@ -168,10 +196,33 @@ impl HubConfig {
                     name: Some(b.name.clone()),
                     addr: b.addr.to_string(),
                     pair_code: b.pair_code.clone(),
+                    enabled: b.enabled,
                 })
                 .collect(),
+            device: self.devices.to_disabled_entries(),
         };
         Ok(toml::to_string_pretty(&file)?)
+    }
+
+    /// Backends that should be polled / shown (enabled flag).
+    pub fn enabled_backends(&self) -> Vec<BackendConfig> {
+        self.backends
+            .iter()
+            .filter(|b| b.enabled)
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_device_enabled(&mut self, serial: &str, enabled: bool) {
+        self.devices.set_enabled(serial, enabled);
+    }
+
+    pub fn set_backend_enabled(&mut self, name: &str, enabled: bool) -> Result<(), ConfigError> {
+        let Some(backend) = self.backends.iter_mut().find(|b| b.name == name) else {
+            return Err(ConfigError::Invalid(format!("node '{name}' not found")));
+        };
+        backend.enabled = enabled;
+        Ok(())
     }
 
     /// Write config atomically (temp file + rename).
@@ -187,6 +238,7 @@ impl HubConfig {
     }
 
     /// Upsert a backend by name (preferred) or matching addr; used by `adb-hub pair`.
+    /// Preserves existing `enabled` when updating; new backends default to enabled.
     pub fn upsert_backend(&mut self, backend: BackendConfig) {
         if let Some(existing) = self.backends.iter_mut().find(|b| b.name == backend.name) {
             existing.addr = backend.addr;
@@ -234,10 +286,13 @@ impl HubConfig {
                 name: default_backend_name(addr),
                 addr,
                 pair_code: None,
+                enabled: true,
             }],
             adb_version: default_adb_version(),
             include_local: true,
             local_adb_port: default_local_adb_port(),
+            devices: DevicePolicyTable::default(),
+            config_path: None,
         })
     }
 
@@ -255,8 +310,109 @@ impl HubConfig {
             adb_version: default_adb_version(),
             include_local: true,
             local_adb_port: default_local_adb_port(),
+            devices: DevicePolicyTable::default(),
+            config_path: None,
         }
     }
+}
+
+/// Snapshot of enable flags used when serving clients / filtering lists.
+#[derive(Clone, Debug, Default)]
+pub struct HubPolicySnapshot {
+    pub devices: DevicePolicyTable,
+    /// backend name → enabled (missing defaults to true)
+    pub backends: HashMap<String, bool>,
+}
+
+impl HubPolicySnapshot {
+    pub fn device_enabled(&self, serial: &str) -> bool {
+        self.devices.is_enabled(serial)
+    }
+
+    pub fn backend_enabled(&self, name: &str) -> bool {
+        self.backends.get(name).copied().unwrap_or(true)
+    }
+
+    pub fn filter_snapshot(&self, snap: DeviceSnapshot) -> DeviceSnapshot {
+        DeviceSnapshot {
+            devices: snap
+                .devices
+                .into_iter()
+                .filter(|d| {
+                    self.backend_enabled(&d.backend_name) && self.device_enabled(&d.public_serial)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Reloads device/node enable policy from the hub config file by mtime.
+pub struct ReloadableHubPolicy {
+    path: Option<PathBuf>,
+    /// Static fallback when there is no config path (CLI-only backends).
+    static_policy: HubPolicySnapshot,
+    cache: Mutex<HubPolicyCache>,
+}
+
+struct HubPolicyCache {
+    mtime: Option<SystemTime>,
+    policy: HubPolicySnapshot,
+}
+
+impl ReloadableHubPolicy {
+    pub fn from_config(config: &HubConfig) -> Self {
+        let static_policy = HubPolicySnapshot {
+            devices: config.devices.clone(),
+            backends: config
+                .backends
+                .iter()
+                .map(|b| (b.name.clone(), b.enabled))
+                .collect(),
+        };
+        let path = config.config_path.clone();
+        let (mtime, policy) = match &path {
+            Some(p) if p.is_file() => {
+                let mtime = fs::metadata(p).ok().and_then(|m| m.modified().ok());
+                let policy = load_hub_policy_file(p).unwrap_or_else(|_| static_policy.clone());
+                (mtime, policy)
+            }
+            _ => (None, static_policy.clone()),
+        };
+        Self {
+            path,
+            static_policy,
+            cache: Mutex::new(HubPolicyCache { mtime, policy }),
+        }
+    }
+
+    pub fn refresh(&self) -> HubPolicySnapshot {
+        let Some(path) = &self.path else {
+            return self.static_policy.clone();
+        };
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        if mtime != guard.mtime {
+            if let Ok(policy) = load_hub_policy_file(path) {
+                guard.mtime = mtime;
+                guard.policy = policy;
+            } else {
+                guard.mtime = mtime;
+            }
+        }
+        guard.policy.clone()
+    }
+}
+
+fn load_hub_policy_file(path: &Path) -> Result<HubPolicySnapshot, ConfigError> {
+    let cfg = HubConfig::load_file(path)?;
+    Ok(HubPolicySnapshot {
+        devices: cfg.devices,
+        backends: cfg
+            .backends
+            .iter()
+            .map(|b| (b.name.clone(), b.enabled))
+            .collect(),
+    })
 }
 
 pub fn default_backend_name(addr: SocketAddr) -> String {
@@ -318,6 +474,7 @@ pub fn parse_backend_arg(s: &str) -> Result<BackendConfig, ConfigError> {
             name: name.to_string(),
             addr,
             pair_code: None,
+            enabled: true,
         })
     } else {
         let addr: SocketAddr = s
@@ -327,6 +484,7 @@ pub fn parse_backend_arg(s: &str) -> Result<BackendConfig, ConfigError> {
             name: default_backend_name(addr),
             addr,
             pair_code: None,
+            enabled: true,
         })
     }
 }
@@ -352,10 +510,31 @@ addr = "10.0.0.2:5038"
         assert_eq!(cfg.backends.len(), 2);
         assert_eq!(cfg.backends[0].name, "office");
         assert_eq!(cfg.backends[0].pair_code.as_deref(), Some("ABCD1234"));
+        assert!(cfg.backends[0].enabled);
         assert_eq!(cfg.backends[1].name, "10.0.0.2_5038");
         assert!(cfg.backends[1].pair_code.is_none());
         assert!(cfg.include_local);
         assert_eq!(cfg.local_adb_port, 5039);
+    }
+
+    #[test]
+    fn parse_disabled_backend_and_device() {
+        let cfg = HubConfig::from_toml_str(
+            r#"
+[[backend]]
+name = "office"
+addr = "192.168.1.10:5038"
+enabled = false
+[[device]]
+serial = "office:A1"
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.backends[0].enabled);
+        assert!(!cfg.devices.is_enabled("office:A1"));
+        assert!(cfg.devices.is_enabled("other"));
+        assert_eq!(cfg.enabled_backends().len(), 0);
     }
 
     #[test]
@@ -401,10 +580,14 @@ local_adb_port = 5040
             name: "office".into(),
             addr: "192.168.1.10:5038".parse().unwrap(),
             pair_code: Some("ABCD1234".into()),
+            enabled: true,
         });
+        cfg.set_device_enabled("A1", false);
         let text = cfg.to_toml_string().unwrap();
+        assert!(text.contains("enabled = false"));
         let loaded = HubConfig::from_toml_str(&text).unwrap();
         assert_eq!(loaded.backends[0].pair_code.as_deref(), Some("ABCD1234"));
+        assert!(!loaded.devices.is_enabled("A1"));
     }
 
     #[test]
@@ -414,11 +597,13 @@ local_adb_port = 5040
             name: "office".into(),
             addr: "10.0.0.1:5038".parse().unwrap(),
             pair_code: Some("AAAAAAAA".into()),
+            enabled: true,
         });
         cfg.upsert_backend(BackendConfig {
             name: "office".into(),
             addr: "10.0.0.2:5038".parse().unwrap(),
             pair_code: Some("BBBBBBBB".into()),
+            enabled: true,
         });
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].addr.to_string(), "10.0.0.2:5038");
