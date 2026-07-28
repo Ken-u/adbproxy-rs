@@ -226,6 +226,8 @@ impl HubConfig {
     }
 
     /// Write config atomically (temp file + rename).
+    /// On Unix, the file mode is set to owner-only (0600) because it may
+    /// contain pair codes.
     pub fn save_file(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -233,6 +235,13 @@ impl HubConfig {
         let text = self.to_toml_string()?;
         let tmp = path.with_extension("toml.tmp");
         fs::write(&tmp, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&tmp)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&tmp, perms)?;
+        }
         fs::rename(&tmp, path)?;
         Ok(())
     }

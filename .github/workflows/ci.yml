@@ -53,6 +53,7 @@ jobs:
           set -euo pipefail
           ./target/debug/adb-proxy.exe --help    | grep -qi 'adb-proxy'
           ./target/debug/adb-hub.exe --help      | grep -qi 'adb-hub'
+          ./target/debug/adb-hubd.exe --help     | grep -qi 'adb-hubd'
 
       - name: Run PowerShell setup tests
         shell: pwsh

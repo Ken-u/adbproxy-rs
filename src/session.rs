@@ -102,6 +102,27 @@ fn route_service(
     default_pair_code: Option<&str>,
     backend_order: &[String],
 ) -> Result<(SocketAddr, Option<String>, String), String> {
+    if let Some((entry, upstream)) = rewrite_upstream_service(service, snap, backend_order)? {
+        return Ok((entry.backend_addr, entry.pair_code.clone(), upstream));
+    }
+
+    // Default: opaque forward to the default backend (local adb or first remote).
+    Ok((
+        default_backend,
+        default_pair_code.map(str::to_string),
+        service.to_string(),
+    ))
+}
+
+/// Resolve a device-scoped host service to `(device entry, rewritten upstream service)`.
+///
+/// Returns `Ok(None)` for opaque / non-device-scoped services that should use the
+/// default backend. Returns `Err` when a named device is missing or offline.
+pub fn rewrite_upstream_service<'a>(
+    service: &'a str,
+    snap: &'a DeviceSnapshot,
+    backend_order: &[String],
+) -> Result<Option<(&'a DeviceEntry, String)>, String> {
     // Exact transport selectors MUST be checked before `host:transport:` /
     // `host:tport:serial:` prefixes — otherwise `transport-any` becomes serial "any".
     if service == "host:tport:any"
@@ -117,78 +138,66 @@ fn route_service(
         } else {
             format!("host:transport:{}", entry.upstream_serial)
         };
-        return Ok((entry.backend_addr, entry.pair_code.clone(), upstream));
+        return Ok(Some((entry, upstream)));
     }
 
-    // host:tport:serial:SERIAL  (before generic transport:)
     if let Some(serial) = service.strip_prefix("host:tport:serial:") {
         let entry = lookup_online(snap, serial)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
+        return Ok(Some((
+            entry,
             format!("host:tport:serial:{}", entry.upstream_serial),
-        ));
+        )));
     }
 
-    // host:transport:SERIAL
     if let Some(serial) = service.strip_prefix("host:transport:") {
         let entry = lookup_online(snap, serial)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
+        return Ok(Some((
+            entry,
             format!("host:transport:{}", entry.upstream_serial),
-        ));
+        )));
     }
 
-    // host-serial:SERIAL:request…
     if let Some(rest) = service.strip_prefix("host-serial:") {
         let Some((serial, request)) = rest.split_once(':') else {
             return Err("invalid host-serial service".into());
         };
         let entry = lookup_device(snap, serial)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
+        return Ok(Some((
+            entry,
             format!("host-serial:{}:{}", entry.upstream_serial, request),
-        ));
+        )));
     }
 
-    // host-usb:<request> / host-local:<request> — device-scoped without -s
     if let Some(request) = service.strip_prefix("host-usb:") {
         let entry = pick_preferred(snap, backend_order)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
+        return Ok(Some((
+            entry,
             format!("host-serial:{}:{}", entry.upstream_serial, request),
-        ));
+        )));
     }
     if let Some(request) = service.strip_prefix("host-local:") {
         let entry = pick_preferred(snap, backend_order)?;
-        return Ok((
-            entry.backend_addr,
-            entry.pair_code.clone(),
+        return Ok(Some((
+            entry,
             format!("host-serial:{}:{}", entry.upstream_serial, request),
-        ));
+        )));
     }
 
-    // host:features — send to the same backend we'd pick for shell without -s,
-    // so feature bits match the device that will actually be used.
     if service == "host:features" || service == "host:host-features" {
         if let Ok(entry) = pick_preferred(snap, backend_order) {
-            return Ok((
-                entry.backend_addr,
-                entry.pair_code.clone(),
-                service.to_string(),
-            ));
+            return Ok(Some((entry, service.to_string())));
         }
     }
 
-    // Default: opaque forward to the default backend (local adb or first remote).
-    Ok((
-        default_backend,
-        default_pair_code.map(str::to_string),
-        service.to_string(),
-    ))
+    Ok(None)
+}
+
+/// Public alias used by the multi-user daemon.
+pub fn pick_preferred_device<'a>(
+    snap: &'a DeviceSnapshot,
+    backend_order: &[String],
+) -> Result<&'a DeviceEntry, String> {
+    pick_preferred(snap, backend_order)
 }
 
 fn lookup_device<'a>(snap: &'a DeviceSnapshot, public_serial: &str) -> Result<&'a DeviceEntry, String> {
@@ -358,6 +367,7 @@ mod route_tests {
                 backend_name: "office".into(),
                 backend_addr: "10.0.0.1:5038".parse().unwrap(),
                 pair_code: Some("ABCD1234".into()),
+                route_id: None,
             }],
         }
     }
@@ -424,6 +434,7 @@ mod route_tests {
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
                     pair_code: None,
+                    route_id: None,
                 },
                 DeviceEntry {
                     public_serial: "REMOTE1".into(),
@@ -433,6 +444,7 @@ mod route_tests {
                     backend_name: "office".into(),
                     backend_addr: "10.0.0.1:5038".parse().unwrap(),
                     pair_code: Some("ABCD1234".into()),
+                    route_id: None,
                 },
             ],
         };
@@ -462,6 +474,7 @@ mod route_tests {
                     backend_name: "office".into(),
                     backend_addr: "10.0.0.1:5038".parse().unwrap(),
                     pair_code: Some("CODE1111".into()),
+                    route_id: None,
                 },
                 DeviceEntry {
                     public_serial: "REMOTE2".into(),
@@ -471,6 +484,7 @@ mod route_tests {
                     backend_name: "lab".into(),
                     backend_addr: "10.0.0.2:5038".parse().unwrap(),
                     pair_code: Some("CODE2222".into()),
+                    route_id: None,
                 },
             ],
         };
@@ -500,6 +514,7 @@ mod route_tests {
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
                     pair_code: None,
+                    route_id: None,
                 },
                 DeviceEntry {
                     public_serial: "L2".into(),
@@ -509,6 +524,7 @@ mod route_tests {
                     backend_name: "local".into(),
                     backend_addr: "127.0.0.1:5039".parse().unwrap(),
                     pair_code: None,
+                    route_id: None,
                 },
             ],
         };

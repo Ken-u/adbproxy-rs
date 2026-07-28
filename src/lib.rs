@@ -3,11 +3,21 @@ pub mod backend;
 pub mod config;
 pub mod hub;
 pub mod local;
+pub mod peercred;
 pub mod policy;
 pub mod protocol;
 pub mod proxy_config;
 pub mod registry;
+pub mod service;
 pub mod session;
+pub mod tenant;
+
+#[cfg(unix)]
+pub mod agent;
+#[cfg(unix)]
+pub mod daemon;
+#[cfg(unix)]
+pub mod ipc;
 
 use std::future::Future;
 use std::io;

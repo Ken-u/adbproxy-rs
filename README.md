@@ -1,9 +1,11 @@
 # adb-proxy / adb-hub
 
-This repository provides two binaries:
+This repository provides two user-facing binaries:
 
 1. **`adb-proxy`** — TCP proxy on the machine that has USB devices (pair-code auth required)
-2. **`adb-hub`** — local ADB-protocol server on the client machine (`127.0.0.1:5037`) that aggregates multiple remote `adb-proxy` backends
+2. **`adb-hub`** — local hub for stock `adb` (`127.0.0.1:5037`): USB + remote `adb-proxy` backends
+
+`adb-hubd` is a compatibility alias for `adb-hub --daemon`.
 
 ```text
 Client PC                         Device hosts
@@ -18,6 +20,8 @@ adb-hub :5037  ----TCP---->  adb-proxy :5038  -->  adb server :5037  --> USB
 `adb-hub` speaks just enough of the ADB host protocol to merge device lists. Other host services (`features`, `version`, `tport`, `transport`, …) are forwarded as-is to the owning backend (or the default/local adb server).
 
 Remote `adb-proxy` instances require an 8-character pair code (`A-Z0-9`) on every connection. The port may be open on the LAN, but ADB traffic is rejected until the hub authenticates with the matching code.
+
+On Linux shared hosts, the same commands work for every OS user: the first `adb-hub` owns `:5037` and shared USB devices; later users automatically join and only see shared USB plus **their own** paired remotes. Pair codes never leave the user's process. Details: [docs/multi-user-design.md](docs/multi-user-design.md).
 
 ## Device host (USB machine)
 
@@ -36,7 +40,7 @@ adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 # ADB_PROXY_PAIR_CODE=ABCD1234 adb-proxy ...
 ```
 
-## Client (your laptop)
+## Client (your machine)
 
 Stop any local adb server that already owns `:5037`, then pair and start the hub:
 
@@ -49,8 +53,16 @@ adb kill-server
 adb-hub pair 192.168.1.10:5038 ABCD1234 --name office
 adb-hub pair 192.168.1.11:5038 EFGH5678 --name lab
 
-# Start hub (loads paired backends from config)
-adb-hub
+# Start hub (same command for one user or many users on a Linux server)
+adb-hub --daemon
+# equivalent:
+# adb-hub
+```
+
+Then use stock adb:
+
+```bash
+adb devices
 ```
 
 You can still pass backends on the CLI (without a pair code they cannot talk to an auth-gated proxy):
@@ -219,7 +231,7 @@ GitHub Actions builds downloadable archives:
 - `adb-proxy-macos-x86_64.tar.gz`
 - `adb-proxy-windows-x86_64.tar.gz`
 
-Each archive includes both `adb-proxy` and `adb-hub` (or `adb-hub.exe` on Windows).
+Each archive includes `adb-proxy`, `adb-hub`, and `adb-hubd` (alias of `adb-hub --daemon`).
 
 ## Automatic Releases
 
@@ -247,8 +259,10 @@ cargo run --bin adb-hub -- --no-local
 Implemented:
 
 - TCP `adb-proxy` with pair-code auth on every connection (device host)
-- Protocol-aware `adb-hub` on `:5037` (client)
-- `adb-hub pair <host:port> <code> [--name]` persists backends + pair codes
+- Unified `adb-hub` / `adb-hub --daemon` for stock `adb` on `:5037`
+- On Linux: shared listener + per-user backends automatically (no separate agent command needed)
+- Elsewhere: same CLI runs the classic in-process aggregator
+- `adb-hub pair|unpair|list` persists backends + pair codes (owner-only config mode on Unix)
 - Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
 - Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend
@@ -261,3 +275,4 @@ Not in this phase:
 
 - LAN auto-discovery
 - Sharing `:5037` with a separately started default adb server (hub relocates local adb to `local_adb_port`)
+- Device lease / locking for shared USB devices across users

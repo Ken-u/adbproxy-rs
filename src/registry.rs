@@ -17,7 +17,13 @@ pub struct DeviceEntry {
     pub extras: String,
     pub backend_name: String,
     pub backend_addr: SocketAddr,
+    /// Pair code for single-user hub → remote proxy. Never set in multi-user
+    /// daemon state (agent owns credentials; use `route_id` instead).
     pub pair_code: Option<String>,
+    /// Opaque route token for multi-user private devices. Present only when
+    /// the device was reported by a per-user agent; daemon must open streams
+    /// via that agent and must never treat this as a credential.
+    pub route_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -155,6 +161,7 @@ pub fn merge_device_lists(lists: &[(BackendConfig, String)]) -> DeviceSnapshot {
             backend_name: backend.name.clone(),
             backend_addr: backend.addr,
             pair_code: backend.pair_code.clone(),
+            route_id: None,
         });
     }
 
@@ -222,6 +229,7 @@ mod tests {
                 backend_name: "a".into(),
                 backend_addr: "1.1.1.1:1".parse().unwrap(),
                 pair_code: None,
+                route_id: None,
             }],
         };
         assert_eq!(snap.format_devices(false), "X\tdevice\n");

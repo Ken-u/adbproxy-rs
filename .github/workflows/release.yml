@@ -128,7 +128,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for bin in adb-proxy adb-hub; do
+          for bin in adb-proxy adb-hub adb-hubd; do
             file "${{ matrix.bin_dir }}/$bin"
             ldd "${{ matrix.bin_dir }}/$bin" 2>&1 | grep -E 'not a dynamic executable|statically linked'
           done
@@ -142,19 +142,21 @@ jobs:
           suffix="${{ matrix.exe_suffix }}"
           cp "${{ matrix.bin_dir }}/adb-proxy${suffix}" "$staging/adb-proxy${suffix}"
           cp "${{ matrix.bin_dir }}/adb-hub${suffix}" "$staging/adb-hub${suffix}"
-          chmod +x "$staging/adb-proxy${suffix}" "$staging/adb-hub${suffix}"
+          cp "${{ matrix.bin_dir }}/adb-hubd${suffix}" "$staging/adb-hubd${suffix}"
+          chmod +x "$staging/adb-proxy${suffix}" "$staging/adb-hub${suffix}" "$staging/adb-hubd${suffix}"
           printf '%s\n' \
-            'adb-proxy + adb-hub' \
+            'adb-proxy + adb-hub (+ adb-hubd alias)' \
             '' \
             'On the USB device host:' \
             '' \
             '    adb start-server' \
             '    ./adb-proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037' \
             '' \
-            'On the client laptop:' \
+            'On the client (one user or many on Linux):' \
             '' \
             '    adb kill-server' \
-            '    ./adb-hub --backend office=<server_ip>:5038' \
+            '    ./adb-hub pair <server_ip>:5038 <PAIR_CODE> --name office' \
+            '    ./adb-hub --daemon' \
             '    adb devices' \
             > "$staging/README.txt"
           tar -C "$staging" -czf "dist/${{ matrix.archive }}" .

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use adb_proxy::auth::{authenticate_stream, validate_pair_code};
 use adb_proxy::backend::fetch_devices_l;
@@ -8,30 +9,41 @@ use adb_proxy::config::{
     default_backend_name, default_config_path, legacy_config_path, old_config_path,
     parse_backend_arg, BackendConfig, HubConfig,
 };
-use adb_proxy::hub::run_hub_with_shutdown;
 use adb_proxy::policy::DevicePolicyTable;
 use adb_proxy::registry::merge_device_lists;
+use adb_proxy::service::{run_service_with_shutdown, ServiceConfig};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+use adb_proxy::agent::{run_agent_with_shutdown, AgentConfig};
+#[cfg(unix)]
+use adb_proxy::ipc::DEFAULT_CONTROL_ABSTRACT;
+#[cfg(unix)]
+use adb_proxy::peercred::{multi_user_supported, multi_user_unsupported_reason};
+
 #[derive(Debug, Parser)]
 #[command(name = "adb-hub")]
-#[command(about = "Local adb server that aggregates local USB + remote adb-proxy backends")]
+#[command(about = "Local adb hub: aggregates USB + remote adb-proxy backends for stock adb")]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Run the hub service (default when no subcommand). On Linux this owns or
+    /// joins the shared :5037 listener and registers this user's backends.
+    #[arg(long)]
+    daemon: bool,
 
     /// Listen address (default 127.0.0.1:5037)
     #[arg(long, env = "ADB_HUB_LISTEN", global = true)]
     listen: Option<SocketAddr>,
 
-    /// Path to TOML config (default: %APPDATA%\adb-hub\config.toml on Windows,
-    /// ~/.config/adb-hub\config.toml on Linux/macOS)
+    /// Path to TOML config
     #[arg(long, env = "ADB_HUB_CONFIG", global = true)]
     config: Option<PathBuf>,
 
-    /// Backend as name=host:port or host:port (repeatable; overrides config backends)
+    /// Backend as name=host:port or host:port (repeatable)
     #[arg(long = "backend", value_name = "SPEC")]
     backends: Vec<String>,
 
@@ -39,13 +51,23 @@ struct Args {
     #[arg(long, env = "ADB_HUB_POLL_MS")]
     poll_interval_ms: Option<u64>,
 
-    /// Do not start/aggregate the local USB adb server (default: aggregate local)
+    /// Do not start/aggregate the local USB adb server
     #[arg(long = "no-local", env = "ADB_HUB_NO_LOCAL")]
     no_local: bool,
 
     /// Side port for the real local adb server (default 5039)
     #[arg(long, env = "ADB_HUB_LOCAL_PORT")]
     local_port: Option<u16>,
+
+    #[cfg(unix)]
+    /// Abstract control socket name (advanced)
+    #[arg(long, default_value = DEFAULT_CONTROL_ABSTRACT, env = "ADB_HUB_CONTROL", hide = true)]
+    control: String,
+
+    #[cfg(unix)]
+    /// Filesystem control socket path (advanced / tests)
+    #[arg(long, env = "ADB_HUB_CONTROL_PATH", hide = true)]
+    control_path: Option<PathBuf>,
 
     #[arg(long, default_value = "info", env = "ADB_HUB_LOG", global = true)]
     log_level: String,
@@ -55,20 +77,30 @@ struct Args {
 enum Commands {
     /// Pair with a remote adb-proxy and save it to the hub config
     Pair {
-        /// adb-proxy address (host:port)
         addr: SocketAddr,
-        /// 8-character A-Z0-9 pair code shown by adb-proxy
         code: String,
-        /// Backend name stored in config (default derived from addr)
         #[arg(long)]
         name: Option<String>,
     },
-    /// Manage device enable state (public serial)
+    /// Remove a paired backend by name
+    Unpair { name: String },
+    /// List paired backends from config
+    List,
+    /// Advanced: agent-only (normally started automatically by `adb-hub --daemon`)
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Agent {
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long, default_value = DEFAULT_CONTROL_ABSTRACT, env = "ADB_HUB_CONTROL")]
+        control: String,
+        #[arg(long, env = "ADB_HUB_CONTROL_PATH")]
+        control_path: Option<PathBuf>,
+    },
     Device {
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Manage paired node (backend) enable state
     Node {
         #[command(subcommand)]
         action: NodeAction,
@@ -101,6 +133,47 @@ async fn main() {
                 process::exit(1);
             }
         }
+        Some(Commands::Unpair { name }) => {
+            if let Err(err) = run_unpair(&name, args.config.as_ref()) {
+                eprintln!("adb-hub unpair error: {err}");
+                process::exit(1);
+            }
+        }
+        Some(Commands::List) => {
+            if let Err(err) = run_list(args.config.as_ref()) {
+                eprintln!("adb-hub list error: {err}");
+                process::exit(1);
+            }
+        }
+        #[cfg(unix)]
+        Some(Commands::Agent {
+            foreground,
+            control,
+            control_path,
+        }) => {
+            let _ = foreground;
+            if !multi_user_supported() {
+                eprintln!("adb-hub agent: {}", multi_user_unsupported_reason());
+                process::exit(2);
+            }
+            let config = AgentConfig {
+                config_path: args.config.clone().unwrap_or_else(default_config_path),
+                control_abstract: control,
+                control_path,
+                poll_interval: Duration::from_millis(
+                    args.poll_interval_ms.unwrap_or(1000).max(100),
+                ),
+                ..AgentConfig::default()
+            };
+            if let Err(err) = run_agent_with_shutdown(config, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            {
+                eprintln!("adb-hub agent error: {err}");
+                process::exit(1);
+            }
+        }
         Some(Commands::Device { action }) => {
             if let Err(err) = run_device(action, args.config.as_ref()).await {
                 eprintln!("adb-hub device error: {err}");
@@ -114,24 +187,34 @@ async fn main() {
             }
         }
         None => {
-            let config = match build_config(&args) {
-                Ok(c) => c,
-                Err(err) => {
-                    eprintln!("adb-hub config error: {err}");
-                    process::exit(2);
-                }
-            };
-
-            if let Err(err) = run_hub_with_shutdown(config, async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            {
+            // `adb-hub` and `adb-hub --daemon` are the same unified service.
+            let _ = args.daemon;
+            if let Err(err) = run_default_service(&args).await {
                 eprintln!("adb-hub error: {err}");
                 process::exit(1);
             }
         }
     }
+}
+
+async fn run_default_service(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let hub = build_config(args)?;
+    let mut service = ServiceConfig::from_hub(hub);
+    #[cfg(unix)]
+    {
+        service.control_abstract = args.control.clone();
+        service.control_path = args.control_path.clone();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &mut service;
+    }
+
+    run_service_with_shutdown(service, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+    Ok(())
 }
 
 async fn run_pair(
@@ -168,6 +251,33 @@ async fn run_pair(
         "paired backend '{backend_name}' at {addr} (pair_code saved to {})",
         path.display()
     );
+    Ok(())
+}
+
+fn run_unpair(name: &str, config_path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = resolve_config_path(config_path);
+    let mut config = load_or_empty(&path)?;
+    let before = config.backends.len();
+    config.backends.retain(|b| b.name != name);
+    if config.backends.len() == before {
+        return Err(format!("backend '{name}' not found").into());
+    }
+    config.save_file(&path)?;
+    println!("unpaired backend '{name}' ({})", path.display());
+    Ok(())
+}
+
+fn run_list(config_path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = resolve_config_path(config_path);
+    let config = load_or_empty(&path)?;
+    println!("{:<20} {:<24} ENABLED", "NAME", "ADDR");
+    for b in &config.backends {
+        let enabled = if b.enabled { "yes" } else { "no" };
+        println!("{:<20} {:<24} {enabled}", b.name, b.addr);
+    }
+    if config.backends.is_empty() {
+        println!("(no paired backends)");
+    }
     Ok(())
 }
 
@@ -284,7 +394,7 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
         }
         HubConfig {
             listen: HubConfig::default_listen(),
-            poll_interval: std::time::Duration::from_millis(1000),
+            poll_interval: Duration::from_millis(1000),
             backends,
             adb_version: 41,
             include_local: !args.no_local,
@@ -312,14 +422,17 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
                 }
                 c
             }
-            Err(_) if !args.no_local => {
+            // No config is fine: shared local devices still work; remotes appear after pair.
+            Err(_) => {
                 let mut c = HubConfig::local_only();
+                if args.no_local {
+                    c.include_local = false;
+                }
                 if let Some(p) = args.local_port {
                     c.local_adb_port = p;
                 }
                 c
             }
-            Err(err) => return Err(err),
         }
     };
 
@@ -327,10 +440,9 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
         config.listen = listen;
     }
     if let Some(ms) = args.poll_interval_ms {
-        config.poll_interval = std::time::Duration::from_millis(ms.max(100));
+        config.poll_interval = Duration::from_millis(ms.max(100));
     }
 
-    // Deduplicate by keeping last definition of a name.
     let mut seen = std::collections::HashSet::new();
     let mut unique: Vec<BackendConfig> = Vec::new();
     for b in config.backends.into_iter().rev() {
@@ -341,14 +453,6 @@ fn build_config(args: &Args) -> Result<HubConfig, Box<dyn std::error::Error>> {
     unique.reverse();
     config.backends = unique;
 
-    if config.backends.iter().all(|b| !b.enabled) && !config.include_local {
-        return Err("no enabled backends configured; enable a node or use --local".into());
-    }
-
-    if config.backends.is_empty() && !config.include_local {
-        return Err("no backends configured; use --backend, a config file, or enable --local".into());
-    }
-
     Ok(config)
 }
 
@@ -357,8 +461,6 @@ fn load_default_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
     if path.is_file() {
         return Ok(HubConfig::load_file(&path)?);
     }
-    // Fall back to the previous Windows location (~/.config/adb-hub/config.toml)
-    // so existing installs keep working after the APPDATA migration.
     let old = old_config_path();
     if old.is_file() && old != path {
         eprintln!(
@@ -377,13 +479,7 @@ fn load_default_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
         );
         return Ok(HubConfig::load_legacy_file(&legacy)?);
     }
-    Err(format!(
-        "no config found at {}, {}, or {}; pass --backend name=host:port or rely on --local",
-        path.display(),
-        old.display(),
-        legacy.display()
-    )
-    .into())
+    Err(format!("no config at {}", path.display()).into())
 }
 
 fn init_tracing(log_level: &str) {
