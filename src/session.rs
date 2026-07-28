@@ -69,6 +69,28 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
         return Ok(());
     }
 
+    // Device-info queries without `-s` mean "the one preferred device".
+    // Answer from the aggregated registry so we don't forward to an empty
+    // local adb while remotes actually have devices (breaks `adb root`, etc.).
+    if service == "host:get-state"
+        || service == "host:get-serialno"
+        || service == "host:get-connection-state"
+    {
+        let snap = client_snapshot(&ctx).await;
+        match pick_preferred(&snap, &ctx.backend_order) {
+            Ok(entry) => {
+                let body = if service == "host:get-serialno" {
+                    entry.public_serial.as_str()
+                } else {
+                    entry.state.as_str()
+                };
+                write_okay_payload(&mut client, body.as_bytes()).await?;
+            }
+            Err(reason) => write_fail(&mut client, &reason).await?,
+        }
+        return Ok(());
+    }
+
     let snap = client_snapshot(&ctx).await;
     match route_service(
         &service,
@@ -186,6 +208,22 @@ pub fn rewrite_upstream_service<'a>(
     if service == "host:features" || service == "host:host-features" {
         if let Ok(entry) = pick_preferred(snap, backend_order) {
             return Ok(Some((entry, service.to_string())));
+        }
+    }
+
+    // `host:get-state` etc. mean "any single device" (ADB SERVICES.TXT).
+    // Rewrite to host-serial on the preferred device so we don't hit an empty
+    // default/local backend while remotes have devices.
+    if let Some(request) = service.strip_prefix("host:") {
+        if matches!(
+            request,
+            "get-state" | "get-serialno" | "get-devpath" | "get-connection-state"
+        ) {
+            let entry = pick_preferred(snap, backend_order)?;
+            return Ok(Some((
+                entry,
+                format!("host-serial:{}:{}", entry.upstream_serial, request),
+            )));
         }
     }
 
@@ -612,5 +650,35 @@ mod route_tests {
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host:features");
+    }
+
+    #[test]
+    fn get_state_rewrites_to_preferred_host_serial() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let (addr, code, svc) = route_service(
+            "host:get-state",
+            &snap_one(),
+            default,
+            None,
+            &order(&["local", "office"]),
+        )
+        .unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5038");
+        assert_eq!(code.as_deref(), Some("ABCD1234"));
+        assert_eq!(svc, "host-serial:ABC:get-state");
+    }
+
+    #[test]
+    fn get_state_errors_when_no_devices() {
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let err = route_service(
+            "host:get-state",
+            &DeviceSnapshot { devices: vec![] },
+            default,
+            None,
+            &order(&["local"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("no devices"));
     }
 }

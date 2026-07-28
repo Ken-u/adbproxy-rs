@@ -30,7 +30,7 @@ use crate::protocol::{
     read_packet, write_fail, write_okay, write_okay_payload, write_packet, write_service,
 };
 use crate::registry::DeviceSnapshot;
-use crate::session::rewrite_upstream_service;
+use crate::session::{pick_preferred_device, rewrite_upstream_service};
 use crate::tenant::{TenantRegistry, Uid};
 
 #[derive(Debug, Error)]
@@ -528,6 +528,24 @@ async fn handle_adb_client(
         let ver = state.adb_version.load(Ordering::Relaxed);
         let body = format!("{ver:04x}");
         write_okay_payload(&mut client, body.as_bytes()).await?;
+        return Ok(());
+    }
+
+    if service == "host:get-state"
+        || service == "host:get-serialno"
+        || service == "host:get-connection-state"
+    {
+        match pick_preferred_device(&snap, &backend_order) {
+            Ok(entry) => {
+                let body = if service == "host:get-serialno" {
+                    entry.public_serial.as_str()
+                } else {
+                    entry.state.as_str()
+                };
+                write_okay_payload(&mut client, body.as_bytes()).await?;
+            }
+            Err(reason) => write_fail(&mut client, &reason).await?,
+        }
         return Ok(());
     }
 
