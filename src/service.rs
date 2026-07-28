@@ -14,12 +14,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::HubConfig;
 use crate::hub::{run_hub_with_shutdown, HubError};
 use crate::peercred::multi_user_supported;
 
+#[cfg(unix)]
+use tracing::warn;
 #[cfg(unix)]
 use crate::agent::{run_agent_with_shutdown, AgentConfig, AgentError};
 #[cfg(unix)]

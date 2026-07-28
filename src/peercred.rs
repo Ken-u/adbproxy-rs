@@ -374,7 +374,7 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{peer_cred_unix, tcp_peer_uid};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn peer_cred_unix(_stream: &tokio::net::UnixStream) -> io::Result<PeerCred> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
