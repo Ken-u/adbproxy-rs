@@ -26,6 +26,7 @@ use adb_proxy::peercred::{multi_user_supported, multi_user_unsupported_reason};
 #[derive(Debug, Parser)]
 #[command(name = "adb-hub")]
 #[command(about = "Local adb hub: aggregates USB + remote adb-proxy backends for stock adb")]
+#[command(version = adb_proxy::VERSION)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,

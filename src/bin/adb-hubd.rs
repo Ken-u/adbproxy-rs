@@ -19,6 +19,7 @@ const DEFAULT_CONTROL_ABSTRACT: &str = "adb-hubd";
 #[derive(Debug, Parser)]
 #[command(name = "adb-hubd")]
 #[command(about = "Same as `adb-hub --daemon` (compatibility alias)")]
+#[command(version = adb_proxy::VERSION)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:5037", env = "ADB_HUBD_LISTEN")]
     listen: SocketAddr,

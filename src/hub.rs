@@ -101,10 +101,12 @@ pub async fn run_hub_with_shutdown(
         })?;
 
     info!(
+        version = crate::VERSION,
         listen = %config.listen,
         backends = config.backends.len(),
         include_local = config.include_local,
-        "adb-hub listening"
+        "adb-hub {} listening",
+        crate::VERSION
     );
     for b in &config.backends {
         info!(name = %b.name, addr = %b.addr, "backend configured");

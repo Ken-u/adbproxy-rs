@@ -16,6 +16,44 @@ pub struct PeerCred {
     pub gid: u32,
 }
 
+/// Resolve a UID to a username when possible (`getpwuid`), else `uid=<n>`.
+pub fn username_for_uid(uid: Uid) -> String {
+    #[cfg(unix)]
+    {
+        username_for_uid_unix(uid)
+    }
+    #[cfg(not(unix))]
+    {
+        format!("uid={uid}")
+    }
+}
+
+#[cfg(unix)]
+fn username_for_uid_unix(uid: Uid) -> String {
+    // Prefer getpwuid_r for thread safety.
+    let mut buf = vec![0u8; 2048];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr((*result).pw_name) };
+        if let Ok(s) = name.to_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    format!("uid={uid}")
+}
+
 /// Whether multi-user shared-5037 mode is supported on this platform.
 pub fn multi_user_supported() -> bool {
     cfg!(target_os = "linux")
@@ -399,5 +437,14 @@ mod tests {
         assert!(is_loopback("127.0.0.1:5037".parse().unwrap()));
         assert!(is_loopback("[::1]:5037".parse().unwrap()));
         assert!(!is_loopback("192.168.1.1:5037".parse().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn username_for_current_uid() {
+        let uid = unsafe { libc::getuid() } as Uid;
+        let name = username_for_uid(uid);
+        assert!(!name.is_empty());
+        assert!(!name.starts_with("uid="), "expected real username, got {name}");
     }
 }

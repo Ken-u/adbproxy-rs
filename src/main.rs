@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(name = "adb-proxy")]
 #[command(about = "TCP proxy for remote adb server access (pair-code auth required)")]
+#[command(version = adb_proxy::VERSION)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,

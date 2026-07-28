@@ -108,7 +108,12 @@ async fn run_classic_service(
     config: ServiceConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    info!(listen = %config.listen, "adb-hub starting");
+    info!(
+        version = crate::VERSION,
+        listen = %config.listen,
+        "adb-hub {} starting (local aggregator)",
+        crate::VERSION
+    );
     let mut hub = config.hub;
     hub.listen = config.listen;
     hub.local_adb_port = config.local_adb_port;
@@ -173,8 +178,10 @@ async fn run_shared_service(
     }
 
     info!(
+        version = crate::VERSION,
         listen = %config.listen,
-        "adb-hub starting (shared listener + this user's backends)"
+        "adb-hub {} starting (shared listener + this user's backends)",
+        crate::VERSION
     );
 
     let (daemon_stop_tx, daemon_stop_rx) = oneshot::channel::<()>();

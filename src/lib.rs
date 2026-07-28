@@ -19,6 +19,9 @@ pub mod daemon;
 #[cfg(unix)]
 pub mod ipc;
 
+/// Crate / binary version from Cargo.toml.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -81,11 +84,12 @@ pub async fn run_proxy_with_shutdown(
     let listener = TcpListener::bind(config.listen).await?;
     let policy = Arc::new(ReloadableProxyPolicy::new(config.policy_path.clone()));
     info!(
+        version = VERSION,
         listen = %config.listen,
         target = %config.target,
         pair_code = %config.pair_code,
         policy = %config.policy_path.display(),
-        "adb-proxy listening (pair with: adb-hub pair <host:port> {})",
+        "adb-proxy {VERSION} listening (pair with: adb-hub pair <host:port> {})",
         config.pair_code
     );
 
@@ -103,15 +107,25 @@ pub async fn run_proxy_with_shutdown(
                 let pair_code = config.pair_code.clone();
                 let policy = policy.clone();
                 // Normal adb clients open many short-lived TCP sessions; keep at debug.
-                debug!(client = %client_addr, target = %target, "client connected");
+                debug!(
+                    version = VERSION,
+                    client = %client_addr,
+                    target = %target,
+                    "client connected"
+                );
 
                 tokio::spawn(async move {
                     match proxy_connection(client, client_addr, target, &pair_code, &policy).await {
                         Ok(None) => {
-                            info!(client = %client_addr, "client rejected (auth)");
+                            info!(
+                                version = VERSION,
+                                client = %client_addr,
+                                "client rejected (auth)"
+                            );
                         }
                         Ok(Some(stats)) => {
                             debug!(
+                                version = VERSION,
                                 client = %stats.client_addr,
                                 target = %stats.target_addr,
                                 bytes_client_to_server = stats.bytes_client_to_server,
@@ -121,10 +135,22 @@ pub async fn run_proxy_with_shutdown(
                             );
                         }
                         Err(err) if is_expected_disconnect(&err) => {
-                            debug!(client = %client_addr, target = %target, error = %err, "client disconnected with socket error");
+                            debug!(
+                                version = VERSION,
+                                client = %client_addr,
+                                target = %target,
+                                error = %err,
+                                "client disconnected with socket error"
+                            );
                         }
                         Err(err) => {
-                            error!(client = %client_addr, target = %target, error = %err, "connection failed");
+                            error!(
+                                version = VERSION,
+                                client = %client_addr,
+                                target = %target,
+                                error = %err,
+                                "connection failed"
+                            );
                         }
                     }
                 });
@@ -178,7 +204,7 @@ async fn proxy_connection(
         Err(err) => return Err(err.into()),
     };
     let service = String::from_utf8_lossy(&service_payload).into_owned();
-    debug!(client = %client_addr, service = %service, "client service");
+    debug!(client = %client_addr, service = %service, version = VERSION, "client service");
 
     if let Some(serial) = transport_serial(&service) {
         if !policy.is_enabled(serial) {

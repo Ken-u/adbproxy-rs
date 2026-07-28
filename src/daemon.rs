@@ -25,13 +25,17 @@ use crate::ipc::{
     PROTOCOL_VERSION, StreamClose, DEFAULT_CONTROL_ABSTRACT,
 };
 use crate::local::LocalAdb;
-use crate::peercred::{is_loopback, multi_user_supported, multi_user_unsupported_reason, peer_cred_unix, tcp_peer_uid};
+use crate::peercred::{
+    is_loopback, multi_user_supported, multi_user_unsupported_reason, peer_cred_unix, tcp_peer_uid,
+    username_for_uid,
+};
 use crate::protocol::{
     read_packet, write_fail, write_okay, write_okay_payload, write_packet, write_service,
 };
 use crate::registry::DeviceSnapshot;
 use crate::session::{pick_preferred_device, rewrite_upstream_service};
 use crate::tenant::{TenantRegistry, Uid};
+use crate::VERSION;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -175,7 +179,11 @@ pub async fn run_daemon_with_shutdown(
             addr: config.listen,
             source,
         })?;
-    info!(listen = %config.listen, "adb-hubd listening (multi-user)");
+    info!(
+        version = VERSION,
+        listen = %config.listen,
+        "adb-hubd {VERSION} listening (multi-user)"
+    );
 
     let poll_state = state.clone();
     let poll_backend = local_backend.clone();
@@ -357,7 +365,8 @@ fn abstract_bind(name: &str) -> io::Result<UnixListener> {
 async fn handle_agent(stream: UnixStream, state: Arc<DaemonState>) -> io::Result<()> {
     let cred = peer_cred_unix(&stream)?;
     let uid = cred.uid;
-    info!(uid, pid = cred.pid, "agent connected");
+    let user = username_for_uid(uid);
+    info!(uid, user = %user, pid = cred.pid, "agent connected");
 
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
@@ -393,6 +402,7 @@ async fn handle_agent(stream: UnixStream, state: Arc<DaemonState>) -> io::Result
         if let Some(old) = agents.insert(uid, conn.clone()) {
             info!(
                 uid,
+                user = %username_for_uid(uid),
                 old_token = %old.instance_token,
                 new_token = %conn.instance_token,
                 "replaced stale agent for uid"
@@ -412,7 +422,11 @@ async fn handle_agent(stream: UnixStream, state: Arc<DaemonState>) -> io::Result
         {
             agents.remove(&uid);
             state.tenants.remove_agent(uid).await;
-            info!(uid, "agent disconnected; private devices removed");
+            info!(
+                uid,
+                user = %username_for_uid(uid),
+                "agent disconnected; private devices removed"
+            );
         }
     }
 
@@ -486,7 +500,8 @@ async fn handle_adb_client(
             return Ok(());
         }
     };
-    debug!(uid, %peer, "ADB client identified");
+    let user = username_for_uid(uid);
+    info!(uid, user = %user, %peer, "ADB client connected");
 
     let payload = match read_packet(&mut client).await {
         Ok(p) => p,
@@ -500,7 +515,7 @@ async fn handle_adb_client(
             return Ok(());
         }
     };
-    debug!(uid, service = %service, "host service");
+    debug!(uid, user = %user, service = %service, "host service");
 
     let snap = state.tenants.snapshot_for(uid).await;
     let backend_order = backend_order(&snap, state.local_backend.as_ref());
