@@ -12,6 +12,7 @@ pub mod registry;
 pub mod service;
 pub mod session;
 pub mod tenant;
+pub mod tunnel;
 
 #[cfg(unix)]
 pub mod agent;

@@ -9,6 +9,7 @@ use adb_proxy::protocol::{
     write_packet, write_service,
 };
 use adb_proxy::wait_for_port;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -86,7 +87,13 @@ async fn mock_backend(
                 if s == serial {
                     let _ = write_okay(&mut socket).await;
                     if let Ok(payload) = read_packet(&mut socket).await {
-                        let _ = write_packet(&mut socket, &payload).await;
+                        if payload.starts_with(b"localabstract:scrcpy_") {
+                            let _ = write_okay(&mut socket).await;
+                            let (mut r, mut w) = socket.split();
+                            let _ = tokio::io::copy(&mut r, &mut w).await;
+                        } else {
+                            let _ = write_packet(&mut socket, &payload).await;
+                        }
                     }
                 } else {
                     let _ = write_fail(&mut socket, "unknown device").await;
@@ -97,8 +104,9 @@ async fn mock_backend(
                 if s == serial {
                     let _ = write_okay(&mut socket).await;
                     // 8-byte transport id
-                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, &[1, 0, 0, 0, 0, 0, 0, 0])
-                        .await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, &[1, 0, 0, 0, 0, 0, 0, 0])
+                            .await;
                     if let Ok(payload) = read_packet(&mut socket).await {
                         let _ = write_packet(&mut socket, &payload).await;
                     }
@@ -113,10 +121,85 @@ async fn mock_backend(
 }
 
 #[tokio::test]
+async fn remote_scrcpy_falls_back_to_a_local_forward_and_cleans_up() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    tokio::spawn(mock_backend(listener, "REMOTE", "", Some("ABCD1234")));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let hub = tokio::spawn(async move {
+        run_hub_with_shutdown(
+            hub_config(
+                hub_addr,
+                vec![backend("remote", backend_addr, Some("ABCD1234"))],
+            ),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_port(hub_addr, Duration::from_secs(3))
+        .await
+        .unwrap();
+
+    async fn selected(addr: SocketAddr) -> TcpStream {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        write_service(&mut s, "host:tport:serial:REMOTE")
+            .await
+            .unwrap();
+        assert_eq!(&read_status(&mut s).await.unwrap(), b"OKAY");
+        let mut id = [0; 8];
+        s.read_exact(&mut id).await.unwrap();
+        s
+    }
+    let mut s = selected(hub_addr).await;
+    write_service(&mut s, "reverse:forward:localabstract:scrcpy_123;tcp:27183")
+        .await
+        .unwrap();
+    assert_eq!(&read_status(&mut s).await.unwrap(), b"FAIL");
+    let _ = read_packet(&mut s).await.unwrap();
+
+    let mut s = selected(hub_addr).await;
+    write_service(&mut s, "host:forward:tcp:0;localabstract:scrcpy_123")
+        .await
+        .unwrap();
+    assert_eq!(&read_status(&mut s).await.unwrap(), b"OKAY");
+    assert_eq!(&read_status(&mut s).await.unwrap(), b"OKAY");
+    let port: u16 = String::from_utf8(read_packet(&mut s).await.unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut video = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    video.write_all(b"video stream").await.unwrap();
+    let mut data = [0; 12];
+    video.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"video stream");
+
+    let mut s = selected(hub_addr).await;
+    write_service(&mut s, &format!("host:killforward:tcp:{port}"))
+        .await
+        .unwrap();
+    assert_eq!(&read_status(&mut s).await.unwrap(), b"OKAY");
+    assert_eq!(&read_status(&mut s).await.unwrap(), b"OKAY");
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    let _ = shutdown_tx.send(());
+    hub.await.unwrap();
+}
+
+#[tokio::test]
 async fn hub_lists_forwards_and_transports() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = backend_listener.local_addr().unwrap();
-    tokio::spawn(mock_backend(backend_listener, "SERIAL1", "product:test", None));
+    tokio::spawn(mock_backend(
+        backend_listener,
+        "SERIAL1",
+        "product:test",
+        None,
+    ));
 
     let hub_addr: SocketAddr = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -125,10 +208,7 @@ async fn hub_lists_forwards_and_transports() {
         a
     };
 
-    let config = hub_config(
-        hub_addr,
-        vec![backend("mock", backend_addr, None)],
-    );
+    let config = hub_config(hub_addr, vec![backend("mock", backend_addr, None)]);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let hub = tokio::spawn(async move {
@@ -139,7 +219,9 @@ async fn hub_lists_forwards_and_transports() {
         .unwrap();
     });
 
-    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    wait_for_port(hub_addr, Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // version is forwarded to backend
@@ -170,7 +252,9 @@ async fn hub_lists_forwards_and_transports() {
     // transport still works via full forward
     {
         let mut c = TcpStream::connect(hub_addr).await.unwrap();
-        write_service(&mut c, "host:transport:SERIAL1").await.unwrap();
+        write_service(&mut c, "host:transport:SERIAL1")
+            .await
+            .unwrap();
         let status = read_status(&mut c).await.unwrap();
         assert_eq!(&status, b"OKAY");
         write_packet(&mut c, b"shell:echo").await.unwrap();
@@ -237,7 +321,9 @@ async fn hub_rewrites_conflicting_serials() {
         .unwrap();
     });
 
-    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    wait_for_port(hub_addr, Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut c = TcpStream::connect(hub_addr).await.unwrap();
@@ -282,7 +368,9 @@ async fn hub_auths_to_paired_backend() {
         .unwrap();
     });
 
-    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    wait_for_port(hub_addr, Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut c = TcpStream::connect(hub_addr).await.unwrap();
@@ -321,7 +409,9 @@ async fn hub_hides_disabled_device() {
         .unwrap();
     });
 
-    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    wait_for_port(hub_addr, Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut c = TcpStream::connect(hub_addr).await.unwrap();
@@ -331,7 +421,9 @@ async fn hub_hides_disabled_device() {
     assert!(!text.contains("HIDE_ME"), "got: {text}");
 
     let mut c = TcpStream::connect(hub_addr).await.unwrap();
-    write_service(&mut c, "host:transport:HIDE_ME").await.unwrap();
+    write_service(&mut c, "host:transport:HIDE_ME")
+        .await
+        .unwrap();
     let status = read_status(&mut c).await.unwrap();
     assert_eq!(&status, b"FAIL");
 
@@ -376,7 +468,9 @@ async fn hub_skips_disabled_node() {
         .unwrap();
     });
 
-    wait_for_port(hub_addr, Duration::from_secs(2)).await.unwrap();
+    wait_for_port(hub_addr, Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut c = TcpStream::connect(hub_addr).await.unwrap();

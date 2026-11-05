@@ -107,6 +107,7 @@ struct DaemonState {
     next_stream_id: AtomicU32,
     local_backend: Option<BackendConfig>,
     adb_version: std::sync::atomic::AtomicU32,
+    tunnels: Arc<crate::tunnel::TunnelManager>,
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
@@ -159,6 +160,7 @@ pub async fn run_daemon_with_shutdown(
         next_stream_id: AtomicU32::new(1),
         local_backend: local_backend.clone(),
         adb_version: std::sync::atomic::AtomicU32::new(config.adb_version),
+        tunnels: Arc::new(crate::tunnel::TunnelManager::default()),
     });
 
     // Seed shared devices before accepting ADB clients.
@@ -422,6 +424,7 @@ async fn handle_agent(stream: UnixStream, state: Arc<DaemonState>) -> io::Result
         {
             agents.remove(&uid);
             state.tenants.remove_agent(uid).await;
+            state.tunnels.remove_owner(uid).await;
             info!(
                 uid,
                 user = %username_for_uid(uid),
@@ -574,6 +577,27 @@ async fn handle_adb_client(
         return Ok(());
     }
 
+    if crate::tunnel::is_transport(&service) {
+        if let Ok(Some((entry, upstream_service))) = rewrite_upstream_service(&service, &snap, &backend_order) {
+            if let Some(route_id) = &entry.route_id {
+                let route = route_id.clone();
+                let selector = format!("host:transport:{}", entry.upstream_serial);
+                let state_for_open = Arc::downgrade(&state);
+                let open: crate::tunnel::OpenStream = Arc::new(move || {
+                    let state = state_for_open.upgrade();
+                    let route = route.clone();
+                    let selector = selector.clone();
+                    Box::pin(async move {
+                        let state = state.ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "hub stopped"))?;
+                        open_private_socket(state, uid, route, selector).await
+                    })
+                });
+                let upstream = open_private_socket(state.clone(), uid, route_id.clone(), upstream_service.clone()).await?;
+                return crate::tunnel::transport(&mut client, upstream, &upstream_service, &entry.public_serial, Some(uid), state.tunnels.clone(), open).await;
+            }
+        }
+    }
+
     match route_multi(&service, &snap, &backend_order, state.local_backend.as_ref()) {
         Ok(Route::Shared { addr, upstream }) => {
             forward_shared(&mut client, addr, &upstream).await
@@ -661,6 +685,22 @@ async fn forward_shared(client: &mut TcpStream, addr: SocketAddr, service: &str)
     }
 }
 
+async fn open_private_socket(state: Arc<DaemonState>, uid: Uid, route_id: String, service: String) -> io::Result<TcpStream> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client = TcpStream::connect(listener.local_addr()?).await?;
+    let expected = client.local_addr()?;
+    let mut server = loop {
+        let (socket, peer) = listener.accept().await?;
+        if peer == expected { break socket; }
+    };
+    tokio::spawn(async move {
+        if let Err(err) = forward_private(&mut server, &state, uid, route_id, service).await {
+            debug!(error = %err, "private tunnel stream closed");
+        }
+    });
+    Ok(client)
+}
+
 async fn forward_private(
     client: &mut TcpStream,
     state: &DaemonState,
@@ -679,9 +719,11 @@ async fn forward_private(
 
     let stream_id = state.next_stream_id.fetch_add(1, Ordering::Relaxed);
     let (otx, orx) = tokio::sync::oneshot::channel();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    agent.stream_tx.lock().await.insert(stream_id, tx);
     agent.open_waiters.lock().await.insert(stream_id, otx);
 
-    write_message(
+    if let Err(err) = write_message(
         &mut *agent.writer.lock().await,
         &IpcMessage::OpenPrivateStream(OpenPrivateStream {
             stream_id,
@@ -689,23 +731,29 @@ async fn forward_private(
             service,
         }),
     )
-    .await?;
+    .await {
+        agent.open_waiters.lock().await.remove(&stream_id);
+        agent.stream_tx.lock().await.remove(&stream_id);
+        return Err(err);
+    }
 
-    let outcome = tokio::time::timeout(Duration::from_secs(10), orx)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "open private stream timeout"))?
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "open waiter dropped"))?;
+    let outcome = match tokio::time::timeout(Duration::from_secs(10), orx).await {
+        Ok(Ok(outcome)) => outcome,
+        other => {
+            agent.open_waiters.lock().await.remove(&stream_id);
+            agent.stream_tx.lock().await.remove(&stream_id);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("open private stream failed: {other:?}")));
+        }
+    };
 
     if !outcome.ok {
+        agent.stream_tx.lock().await.remove(&stream_id);
         let reason = outcome
             .fail_reason
             .unwrap_or_else(|| "open failed".to_string());
         write_fail(client, &reason).await?;
         return Ok(());
     }
-
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-    agent.stream_tx.lock().await.insert(stream_id, tx);
 
     // Bidirectional: client ↔ agent StreamData
     let writer = agent.writer.clone();

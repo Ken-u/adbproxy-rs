@@ -101,6 +101,18 @@ adb -s <serial> shell
 adb install app.apk
 ```
 
+Remote devices can also be used with stock `scrcpy`:
+
+```bash
+scrcpy -s <serial>
+```
+
+For a remote device, the hub makes scrcpy fall back from `adb reverse` to
+`adb forward` and forwards its local TCP connection through the authenticated
+proxy connection. No separate SSH port tunnel is needed. Scrcpy may print an
+`adb reverse` error followed by a fallback warning; this is expected. Local
+USB devices continue to use the local ADB server's normal behavior.
+
 If two backends expose the same serial, the hub rewrites them to `name:serial` (for example `office:ABC123`).
 
 Legacy `~/.adbproxy` (`host=` / `port=`) is still loaded when the TOML config is missing.
@@ -119,7 +131,7 @@ Useful flags:
 
 ```bash
 bash adb_setup.sh --install                    # download + install only
-bash adb_setup.sh --install --version 0.4.4    # pin a release (also accepts v0.4.4)
+bash adb_setup.sh --install --version 0.4.5    # pin a release (also accepts v0.4.5)
 bash adb_setup.sh --config                     # config only
 bash adb_setup.sh --uninstall-wrapper          # remove legacy PATH wrapper
 ```
@@ -143,7 +155,7 @@ Useful flags:
 
 ```powershell
 .\adb_setup.ps1 -Install                    # download + install only
-.\adb_setup.ps1 -Install -Version 0.4.4     # pin a release (also accepts v0.4.4)
+.\adb_setup.ps1 -Install -Version 0.4.5     # pin a release (also accepts v0.4.5)
 .\adb_setup.ps1 -Config                     # interactive config only
 .\adb_setup.ps1 -UninstallWrapper           # remove legacy PATH wrapper
 ```
@@ -275,6 +287,7 @@ Implemented:
 - Auto-starts local `adb` on a side port and aggregates USB devices as `local`
 - Multi-backend device list merge + serial conflict rewrite
 - Opaque forward of non-list host services (`features`, `tport`, `transport`, …) to the owning/default backend
+- Local scrcpy TCP forwarding for remote devices, without an SSH tunnel
 - `host:version`, `host:devices` / `devices-l`, `host:track-devices`, `host:transport:*`, `host:transport-any`, `host:kill`, `host-serial:*` forwarding
 - TOML config + legacy `~/.adbproxy` + CLI `--backend`
 - Per-device enable/disable on proxy and hub (`device list|enable|disable`)

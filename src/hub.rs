@@ -88,6 +88,7 @@ pub async fn run_hub_with_shutdown(
     let backend_order: Vec<String> = config.backends.iter().map(|b| b.name.clone()).collect();
     let registry = DeviceRegistry::new();
     let kill_notify = Arc::new(Notify::new());
+    let tunnels = Arc::new(crate::tunnel::TunnelManager::default());
 
     // Populate registry BEFORE binding so wait_for_port / early clients never see
     // an empty snapshot and return "no devices".
@@ -142,6 +143,7 @@ pub async fn run_hub_with_shutdown(
                     backend_order: backend_order.clone(),
                     kill_notify: kill_notify.clone(),
                     policy: policy.clone(),
+                    tunnels: tunnels.clone(),
                 };
                 tokio::spawn(async move {
                     if let Err(err) = handle_client(client, ctx).await {

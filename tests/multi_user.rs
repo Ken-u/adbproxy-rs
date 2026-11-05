@@ -11,9 +11,11 @@ use adb_proxy::daemon::{run_daemon_with_shutdown, DaemonConfig};
 use adb_proxy::peercred::multi_user_supported;
 use adb_proxy::policy::DevicePolicyTable;
 use adb_proxy::protocol::{
-    read_okay_payload, write_fail, write_okay, write_okay_payload, write_packet, write_service,
+    read_okay_payload, read_packet, read_status, write_fail, write_okay, write_okay_payload,
+    write_packet, write_service,
 };
 use adb_proxy::wait_for_port;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -71,7 +73,13 @@ async fn mock_backend(listener: TcpListener, serial: &'static str, pair: Option<
                 if s == serial {
                     let _ = write_okay(&mut socket).await;
                     if let Ok(payload) = adb_proxy::protocol::read_packet(&mut socket).await {
-                        let _ = write_packet(&mut socket, &payload).await;
+                        if payload.starts_with(b"localabstract:scrcpy_") {
+                            let _ = write_okay(&mut socket).await;
+                            let (mut r, mut w) = socket.split();
+                            let _ = tokio::io::copy(&mut r, &mut w).await;
+                        } else {
+                            let _ = write_packet(&mut socket, &payload).await;
+                        }
                     }
                 } else {
                     let _ = write_fail(&mut socket, "unknown").await;
@@ -178,6 +186,48 @@ async fn agent_publishes_private_devices_to_daemon() {
         text.contains("PRIV1\tdevice"),
         "expected private device in list, got: {text}"
     );
+
+    async fn selected(addr: std::net::SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        write_service(&mut stream, "host:transport:PRIV1")
+            .await
+            .unwrap();
+        assert_eq!(&read_status(&mut stream).await.unwrap(), b"OKAY");
+        stream
+    }
+    let mut stream = selected(listen).await;
+    write_service(
+        &mut stream,
+        "reverse:forward:localabstract:scrcpy_123;tcp:27183",
+    )
+    .await
+    .unwrap();
+    assert_eq!(&read_status(&mut stream).await.unwrap(), b"FAIL");
+    let _ = read_packet(&mut stream).await.unwrap();
+
+    let mut stream = selected(listen).await;
+    write_service(&mut stream, "host:forward:tcp:0;localabstract:scrcpy_123")
+        .await
+        .unwrap();
+    assert_eq!(&read_status(&mut stream).await.unwrap(), b"OKAY");
+    assert_eq!(&read_status(&mut stream).await.unwrap(), b"OKAY");
+    let port: u16 = String::from_utf8(read_packet(&mut stream).await.unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut video = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    video.write_all(b"private video").await.unwrap();
+    let mut data = [0; 13];
+    video.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"private video");
+
+    let mut stream = selected(listen).await;
+    write_service(&mut stream, &format!("host:killforward:tcp:{port}"))
+        .await
+        .unwrap();
+    assert_eq!(&read_status(&mut stream).await.unwrap(), b"OKAY");
+    assert_eq!(&read_status(&mut stream).await.unwrap(), b"OKAY");
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
 
     let _ = a_tx.send(());
     let _ = d_tx.send(());

@@ -24,6 +24,7 @@ pub struct SessionContext {
     pub kill_notify: Arc<Notify>,
     /// Device/node enable policy (reloaded from config by mtime).
     pub policy: Arc<ReloadableHubPolicy>,
+    pub tunnels: Arc<crate::tunnel::TunnelManager>,
 }
 
 /// Handle one adb client connection.
@@ -92,6 +93,23 @@ pub async fn handle_client(mut client: TcpStream, ctx: SessionContext) -> io::Re
     }
 
     let snap = client_snapshot(&ctx).await;
+    if crate::tunnel::is_transport(&service) {
+        if let Ok(Some((entry, upstream_service))) = rewrite_upstream_service(&service, &snap, &ctx.backend_order) {
+            if entry.backend_name != "local" {
+                let addr = entry.backend_addr;
+                let code = entry.pair_code.clone();
+                let selector = format!("host:transport:{}", entry.upstream_serial);
+                let open: crate::tunnel::OpenStream = Arc::new(move || {
+                    Box::pin(crate::tunnel::connect_backend(addr, code.clone(), selector.clone()))
+                });
+                let upstream = match crate::tunnel::connect_backend(addr, entry.pair_code.clone(), upstream_service.clone()).await {
+                    Ok(s) => s,
+                    Err(err) => { write_fail(&mut client, &format!("backend {addr}: {err}")).await?; return Ok(()); }
+                };
+                return crate::tunnel::transport(&mut client, upstream, &upstream_service, &entry.public_serial, None, ctx.tunnels.clone(), open).await;
+            }
+        }
+    }
     match route_service(
         &service,
         &snap,

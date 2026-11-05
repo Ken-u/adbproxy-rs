@@ -101,7 +101,7 @@ fetch_latest_tag() {
     printf '%s\n' "$tag"
 }
 
-# Accept "0.4.4" or "v0.4.4" → always "v0.4.4".
+# Accept "0.4.5" or "v0.4.5" → always "v0.4.5".
 normalize_release_tag() {
     local v="$1"
     v="${v#v}"
@@ -322,7 +322,7 @@ Device host (USB machine):
   ${proxy} --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 
 Re-run install only:   $0 --install
-Install a version:     $0 --install --version 0.4.4
+Install a version:     $0 --install --version 0.4.5
 Config only:           $0 --config
 Remove old wrapper:    $0 --uninstall-wrapper
 EOF
@@ -344,7 +344,7 @@ Usage:
   adb_setup.sh --help
 
 Examples:
-  adb_setup.sh --install --version 0.4.4
+  adb_setup.sh --install --version 0.4.5
   adb_setup.sh --version v0.4.3
 
 Environment:
@@ -385,7 +385,7 @@ main() {
                 ;;
             --version|-v)
                 if [[ $# -lt 2 || -z "${2:-}" ]]; then
-                    echo "Error: $1 requires a value (e.g. 0.4.4 or v0.4.4)." >&2
+                    echo "Error: $1 requires a value (e.g. 0.4.5 or v0.4.5)." >&2
                     exit 1
                 fi
                 REQUESTED_VERSION="$2"

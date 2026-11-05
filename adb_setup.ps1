@@ -5,7 +5,7 @@
 #   .\adb_setup.ps1                 # download + install, then interactive config
 #   .\adb_setup.ps1 -Install        # download + install only
 #   .\adb_setup.ps1 -Config         # interactive config only
-#   .\adb_setup.ps1 -Version 0.4.4  # pin a release tag (with or without leading v)
+#   .\adb_setup.ps1 -Version 0.4.5  # pin a release tag (with or without leading v)
 #   .\adb_setup.ps1 -UninstallWrapper  # remove legacy PATH wrapper
 #
 # Environment:
@@ -50,7 +50,7 @@ Usage:
   .\adb_setup.ps1 -Help
 
 Examples:
-  .\adb_setup.ps1 -Install -Version 0.4.4
+  .\adb_setup.ps1 -Install -Version 0.4.5
   .\adb_setup.ps1 -Version v0.4.3
 
 Environment:
@@ -236,7 +236,7 @@ Device host (USB machine):
   $proxy --listen 0.0.0.0:5038 --target 127.0.0.1:5037
 
 Re-run install only:   .\adb_setup.ps1 -Install
-Install a version:     .\adb_setup.ps1 -Install -Version 0.4.4
+Install a version:     .\adb_setup.ps1 -Install -Version 0.4.5
 Config only:           .\adb_setup.ps1 -Config
 Remove old wrapper:    .\adb_setup.ps1 -UninstallWrapper
 "@
