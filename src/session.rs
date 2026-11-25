@@ -198,7 +198,10 @@ pub fn rewrite_upstream_service<'a>(
     }
 
     if let Some(rest) = service.strip_prefix("host-serial:") {
-        let Some((serial, request)) = rest.split_once(':') else {
+        // Serials may contain colons (network adb: `ip:port`), so split off the
+        // request at the LAST colon: `1.2.3.4:5555:get-state` →
+        // serial `1.2.3.4:5555`, request `get-state`.
+        let Some((serial, request)) = rest.rsplit_once(':') else {
             return Err("invalid host-serial service".into());
         };
         let entry = lookup_device(snap, serial)?;
@@ -684,6 +687,40 @@ mod route_tests {
         assert_eq!(addr.to_string(), "10.0.0.1:5038");
         assert_eq!(code.as_deref(), Some("ABCD1234"));
         assert_eq!(svc, "host-serial:ABC:get-state");
+    }
+
+    #[test]
+    fn host_serial_accepts_ip_port_serial() {
+        let snap = DeviceSnapshot {
+            devices: vec![DeviceEntry {
+                public_serial: "172.16.10.210:5555".into(),
+                upstream_serial: "172.16.10.210:5555".into(),
+                state: "device".into(),
+                extras: String::new(),
+                backend_name: "local".into(),
+                backend_addr: "127.0.0.1:5039".parse().unwrap(),
+                pair_code: None,
+                route_id: None,
+            }],
+        };
+        let default: SocketAddr = "127.0.0.1:5039".parse().unwrap();
+        let o = order(&["local"]);
+        let (addr, code, svc) = route_service(
+            "host-serial:172.16.10.210:5555:get-state",
+            &snap,
+            default,
+            None,
+            &o,
+        )
+        .unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:5039");
+        assert_eq!(code, None);
+        assert_eq!(svc, "host-serial:172.16.10.210:5555:get-state");
+
+        let (_, _, features) =
+            route_service("host-serial:172.16.10.210:5555:features", &snap, default, None, &o)
+                .unwrap();
+        assert_eq!(features, "host-serial:172.16.10.210:5555:features");
     }
 
     #[test]
