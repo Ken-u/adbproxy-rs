@@ -20,7 +20,7 @@ struct Args {
     command: Option<Commands>,
 
     /// Print version
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(short = 'v', long = "version")]
     version: bool,
 
     #[arg(long, default_value = "0.0.0.0:5038", env = "ADB_PROXY_LISTEN", global = true)]
@@ -68,6 +68,10 @@ enum DeviceAction {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.version {
+        println!("adb-proxy {}", adb_proxy::VERSION);
+        return Ok(());
+    }
     init_tracing(&args.log_level);
 
     let policy_path = args

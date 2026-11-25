@@ -22,7 +22,7 @@ const DEFAULT_CONTROL_ABSTRACT: &str = "adb-hubd";
 #[command(version = adb_proxy::VERSION, disable_version_flag = true)]
 struct Args {
     /// Print version
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(short = 'v', long = "version")]
     version: bool,
 
     #[arg(long, default_value = "127.0.0.1:5037", env = "ADB_HUBD_LISTEN")]
@@ -56,6 +56,10 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.version {
+        println!("adb-hubd {}", adb_proxy::VERSION);
+        return;
+    }
     init_tracing(&args.log_level);
     let _ = args.foreground;
 

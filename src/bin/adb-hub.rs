@@ -33,7 +33,7 @@ struct Args {
     command: Option<Commands>,
 
     /// Print version
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(short = 'v', long = "version")]
     version: bool,
 
     /// Run the hub service (default when no subcommand). On Linux this owns or
@@ -130,6 +130,10 @@ enum NodeAction {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.version {
+        println!("adb-hub {}", adb_proxy::VERSION);
+        return;
+    }
     init_tracing(&args.log_level);
 
     match args.command {
