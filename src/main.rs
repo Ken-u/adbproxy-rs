@@ -14,10 +14,14 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(name = "adb-proxy")]
 #[command(about = "TCP proxy for remote adb server access (pair-code auth required)")]
-#[command(version = adb_proxy::VERSION)]
+#[command(version = adb_proxy::VERSION, disable_version_flag = true)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Print version
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: bool,
 
     #[arg(long, default_value = "0.0.0.0:5038", env = "ADB_PROXY_LISTEN", global = true)]
     listen: SocketAddr,

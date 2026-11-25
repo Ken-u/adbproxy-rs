@@ -27,10 +27,14 @@ use adb_proxy::peercred::{multi_user_supported, multi_user_unsupported_reason};
 #[derive(Debug, Parser)]
 #[command(name = "adb-hub")]
 #[command(about = "Local adb hub: aggregates USB + remote adb-proxy backends for stock adb")]
-#[command(version = adb_proxy::VERSION)]
+#[command(version = adb_proxy::VERSION, disable_version_flag = true)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Print version
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: bool,
 
     /// Run the hub service (default when no subcommand). On Linux this owns or
     /// joins the shared :5037 listener and registers this user's backends.
